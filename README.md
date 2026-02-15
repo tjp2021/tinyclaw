@@ -17,6 +17,10 @@
   </p>
 </div>
 
+<div align="center">
+  <video src="https://github.com/jlia0/tinyclaw/raw/main/docs/videos/tinyclaw.mp4" width="600" controls></video>
+</div>
+
 ## ✨ Features
 
 - ✅ **Multi-agent** - Run multiple isolated AI agents with specialized roles
