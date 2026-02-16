@@ -1,703 +1,857 @@
-# Agent Swarm: Batch Processing at Scale
+# Agent Swarm
 
-## The Problem
-
-TinyClaw's team model works beautifully for conversational workflows: a user asks a question, agents collaborate, and a response comes back. But some tasks aren't conversations — they're **data processing jobs**. Reviewing 3,000 PRs. Triaging 500 issues. Auditing an entire codebase.
-
-The conversational model breaks down here:
-- **Context window limits**: No single agent can hold 3,000 PRs in memory
-- **Sequential bottleneck**: Team fan-out caps at ~15 messages (loop protection)
-- **Unstructured data**: Free-text responses can't be aggregated programmatically
-- **No persistence**: If the process crashes at PR #2,847, you start over
-
-The swarm model solves this by treating agents as **stateless compute workers** in a MapReduce pipeline, processing structured data in batches.
+A general-purpose framework for coordinating many AI agents processing large datasets. Agents are treated as stateless compute workers in a DAG of phases, with structured data flowing between them.
 
 ---
 
-## Architecture Overview
+## Why This Needs to Exist
 
-```
-                        ┌──────────────────────────┐
-                        │      SwarmCoordinator     │
-                        │  (orchestrates the job)   │
-                        └─────────┬────────────────┘
-                                  │
-               ┌──────────────────┼──────────────────┐
-               ▼                  ▼                  ▼
-        ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-        │  Phase: Map  │   │Phase: Reduce│   │Phase: Review│
-        │  (parallel)  │   │ (aggregate) │   │ (selective)  │
-        └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
-               │                  │                  │
-        ┌──────┴──────┐          │           ┌──────┴──────┐
-        ▼      ▼      ▼         ▼           ▼      ▼      ▼
-     ┌────┐ ┌────┐ ┌────┐  ┌────────┐   ┌────┐ ┌────┐ ┌────┐
-     │ W1 │ │ W2 │ │ W3 │  │Reducer │   │ R1 │ │ R2 │ │ R3 │
-     │    │ │    │ │... │  │ Agent  │   │    │ │    │ │... │
-     └────┘ └────┘ └────┘  └────────┘   └────┘ └────┘ └────┘
-       │      │      │         │           │      │      │
-       ▼      ▼      ▼         ▼           ▼      ▼      ▼
-    [JSON] [JSON] [JSON]    [JSON]      [JSON] [JSON] [JSON]
-```
+There are two modes of using AI agents:
 
-### Core Concepts
+1. **Conversational**: A human talks to an agent (or a small team of agents). The unit of work is a conversation. Context is maintained. Responses are free-text. TinyClaw's team system does this well.
 
-| Concept | Description |
-|---------|-------------|
-| **Job** | A complete pipeline definition: data source → phases → output |
-| **Phase** | A stage in the pipeline (map, reduce, filter, review) |
-| **Batch** | A slice of the input data assigned to one worker |
-| **Worker** | A stateless agent invocation that processes one batch |
-| **Schema** | JSON schema defining the input/output contract for each phase |
+2. **Batch**: A system feeds thousands of items through agents for classification, analysis, or transformation. The unit of work is a data item. Agents are stateless. Responses are structured. Nothing does this well today.
 
-### How It Differs from Teams
+The batch model breaks down with naive approaches:
+- **One giant prompt**: Context window limits mean you can't fit 3,000 items in one call
+- **Sequential loop**: Processing items one-at-a-time takes hours and wastes money (no parallelism, no prompt caching)
+- **Unstructured fan-out**: If agents return free-text, you can't programmatically aggregate results
+- **No fault tolerance**: If the process dies at item #2,847, you start over
 
-| | Teams (existing) | Swarm (new) |
-|---|---|---|
-| **Unit of work** | A conversation | A data processing job |
-| **Agent state** | Persistent (conversation history) | Stateless (fresh each batch) |
-| **Data format** | Free text | Structured JSON with schemas |
-| **Scale** | ~15 messages per conversation | Thousands of items |
-| **Concurrency** | Per-agent promise chains | Configurable worker pool |
-| **Failure handling** | Conversation aborts | Retry individual batches |
-| **Output** | Aggregated text response | Structured report / actions |
+The swarm framework solves this with three ideas:
+1. **Phases** that compose into a DAG (not just linear pipelines)
+2. **Typed data contracts** between phases (JSON schemas, not free text)
+3. **Checkpoint-everything** execution (resume from any failure point)
 
 ---
 
-## The PR Review Pipeline
+## Core Model
 
-This is the concrete use case driving the design. The job: scan 3,000+ open PRs on a repo, de-duplicate, rank, deep-review the best candidates, and produce an actionable report.
+### The Execution DAG
 
-### Phase 0: Ingest
-
-Not an agent phase — this is pure data fetching.
+A swarm job is a directed acyclic graph of phases. Each phase transforms data.
 
 ```
-GitHub API (via gh CLI)
-    │
-    ├── Fetch all open PRs (paginated, 100/page = 30 API calls)
-    │   → title, body, author, created_at, updated_at, labels
-    │   → files changed (names + stats), comments count
-    │   → CI status, review status, merge conflicts
-    │
-    ├── Optionally fetch diffs for top candidates (Phase 3 only)
-    │
-    └── Store as JSON array in job working directory
-        → ~/.tinyclaw/swarm/jobs/{job_id}/data/prs.json
+┌─────────┐     ┌─────────┐     ┌─────────┐
+│ Ingest  │────▶│  Map    │────▶│ Reduce  │──┐
+└─────────┘     └─────────┘     └─────────┘  │
+                                              │
+                ┌─────────┐     ┌─────────┐   │
+                │ Review  │◀────│  Gate   │◀──┘
+                └────┬────┘     └─────────┘
+                     │
+                ┌────▼────┐
+                │ Report  │
+                └─────────┘
 ```
 
-Data per PR (~500 bytes each, 3000 PRs = ~1.5 MB total):
+Phases don't have to be linear. A `gate` phase can branch conditionally. Two independent map phases can run in parallel. The framework resolves the DAG and executes phases in dependency order.
 
-```jsonc
-{
-  "number": 1234,
-  "title": "Add dark mode support",
-  "body": "This PR implements...",  // truncated to 500 chars
-  "author": "alice",
-  "created_at": "2026-02-10T...",
-  "updated_at": "2026-02-14T...",
-  "labels": ["feature", "ui"],
-  "files": ["src/theme.ts", "src/components/App.tsx"],
-  "additions": 245,
-  "deletions": 12,
-  "comments": 3,
-  "ci_status": "success",
-  "review_status": "approved",
-  "has_conflicts": false
-}
-```
+### Phase Types
 
-### Phase 1: Map — Scan & Classify
+| Type | Parallelism | Purpose |
+|------|-------------|---------|
+| **ingest** | 1 | Fetch data from external source (API, filesystem, database) |
+| **map** | N workers | Process each item independently. 1 input item → 1 output item. |
+| **filter** | N workers | Like map, but items can be dropped. 1 input → 0 or 1 output. |
+| **reduce** | 1-few | Aggregate across all items. N inputs → M outputs (M < N). |
+| **gate** | 1 | Conditional routing. Inspect data, decide which downstream phase(s) to activate. |
+| **transform** | 1 | Non-AI programmatic transformation. Pure code, no agent invocation. |
+| **review** | N workers | Like map, but with enriched context (e.g., full diffs, not just metadata). |
+| **report** | 1 | Synthesize all results into final output. |
 
-**Goal**: Every PR gets a structured classification. This is the "scatter" step.
+The key distinction: `map`, `filter`, and `review` phases are **embarrassingly parallel** — every item is independent. `reduce`, `gate`, and `report` phases need to see the full picture.
+
+### Workers
+
+A worker is a single, stateless agent invocation. It receives structured input and must produce structured output matching a declared schema.
 
 ```
-Config:
-  batch_size: 50         # PRs per worker
-  concurrency: 20        # parallel workers
-  model: sonnet          # fast + cheap for classification
-  timeout: 120s          # per batch
-
-Input: batch of 50 PR metadata objects + vision document
-Output: 50 classification objects (1:1 with input)
+Worker = (system_prompt, input_json) → output_json
 ```
 
-**Worker system prompt**:
-```
-You are a PR classifier. For each PR in the input batch, produce a JSON
-classification. You have the project's vision document for alignment scoring.
+Workers have no memory. No conversation history. No personality. They are pure functions over data. This is what makes them parallelizable and retryable — calling a worker twice with the same input should produce equivalent output.
 
-Output ONLY a JSON array. No commentary.
-```
+The framework doesn't care what backs a worker:
+- Claude CLI subprocess
+- Codex CLI subprocess
+- Direct Anthropic API call
+- Claude Agent SDK (`@anthropic-ai/claude-code`)
+- A local script (for non-AI transform phases)
 
-**Worker input** (per batch):
-```jsonc
-{
-  "vision_document": "OpenClaw is a ... (project goals, non-goals, architecture)",
-  "prs": [ /* 50 PR objects */ ]
-}
-```
+This is configured per-phase, and the worker pool abstraction handles the differences.
 
-**Worker output** (per batch):
-```jsonc
-[
-  {
-    "number": 1234,
-    "category": "feature",           // bug-fix, feature, refactor, docs, test, chore, spam
-    "intent": "dark-mode-support",   // normalized short description
-    "areas": ["ui", "theming"],      // logical areas touched
-    "quality_signals": {
-      "has_description": true,
-      "has_tests": false,
-      "ci_passing": true,
-      "small_diff": true,            // < 500 lines
-      "single_concern": true         // touches related files only
-    },
-    "vision_alignment": 8,           // 0-10, how well it fits the project vision
-    "vision_notes": "Aligns with UI improvement goals",
-    "fingerprint": "dark-mode-theme-ui",  // normalized key for dedup grouping
-    "flags": [],                     // ["spam", "off-vision", "massive-diff", "no-description"]
-    "quick_verdict": "review"        // merge, review, close, spam
-  }
-]
-```
+### Data Contracts
 
-**Math**: 3,000 PRs / 50 per batch = 60 batches. At 20 concurrent workers, that's 3 waves. ~6 minutes total.
-
-### Phase 2: Reduce — Cluster & De-duplicate
-
-**Goal**: Group similar PRs, identify duplicates, rank within each cluster.
-
-This phase has lower parallelism because it needs to see cross-batch patterns. The reducer works on the *full* set of Phase 1 outputs, but the data is now compressed (classification objects are ~200 bytes each, so 3,000 = ~600 KB — fits in one context window).
-
-```
-Config:
-  concurrency: 1-3       # reducers (can shard by category)
-  model: sonnet           # needs reasoning for clustering
-  timeout: 300s
-```
-
-**Strategy**: Two-pass reduce.
-
-**Pass 1 — Programmatic pre-clustering** (no agent needed):
-- Group by `fingerprint` field (exact match)
-- Group by overlapping `files` (Jaccard similarity > 0.5)
-- Group by similar `intent` (edit distance / token overlap)
-- This produces initial clusters cheaply
-
-**Pass 2 — Agent-assisted refinement**:
-```jsonc
-// Input: pre-clusters + vision doc
-{
-  "vision_document": "...",
-  "clusters": [
-    {
-      "id": "cluster-17",
-      "theme": "dark-mode",
-      "prs": [
-        { "number": 1234, "title": "Add dark mode support", "author": "alice", "quality_signals": {...}, "vision_alignment": 8 },
-        { "number": 1567, "title": "Dark theme implementation", "author": "bob", "quality_signals": {...}, "vision_alignment": 7 },
-        { "number": 2890, "title": "Night mode toggle", "author": "charlie", "quality_signals": {...}, "vision_alignment": 6 }
-      ]
-    }
-  ]
-}
-```
-
-**Output**:
-```jsonc
-[
-  {
-    "cluster_id": "cluster-17",
-    "theme": "Dark mode / theming",
-    "duplicate_groups": [
-      {
-        "canonical": 1234,
-        "duplicates": [1567, 2890],
-        "confidence": 0.9,
-        "reasoning": "All three implement the same dark mode toggle feature"
-      }
-    ],
-    "best_candidate": 1234,
-    "ranking": [1234, 1567, 2890],
-    "ranking_rationale": "PR #1234 has the best test coverage and smallest diff"
-  }
-]
-```
-
-### Phase 3: Deep Review — Top Candidates Only
-
-**Goal**: Full code review of the best PR in each cluster. This is expensive (fetches diffs), so only the top candidates get it.
-
-```
-Config:
-  batch_size: 5          # PRs per worker (full diffs are large)
-  concurrency: 10        # parallel reviewers
-  model: opus            # needs deep reasoning for code review
-  timeout: 300s
-```
-
-**Selective diff fetching**: Only fetch diffs for PRs that made it through Phase 2 as `best_candidate`. If there are 200 clusters, that's 200 diffs to fetch instead of 3,000.
-
-**Worker input**:
-```jsonc
-{
-  "vision_document": "...",
-  "pr": {
-    "number": 1234,
-    "title": "Add dark mode support",
-    "author": "alice",
-    "diff": "... (full diff) ...",
-    "cluster_context": {
-      "theme": "Dark mode / theming",
-      "duplicate_count": 3,
-      "is_best_candidate": true
-    },
-    "classification": { /* Phase 1 output */ }
-  }
-}
-```
-
-**Worker output**:
-```jsonc
-{
-  "number": 1234,
-  "verdict": "merge",              // merge, request-changes, close
-  "confidence": 0.85,
-  "review": {
-    "summary": "Clean implementation of dark mode with CSS variables...",
-    "strengths": ["Small, focused diff", "Uses existing theme infrastructure"],
-    "concerns": ["Missing tests for toggle persistence", "No RTL support"],
-    "vision_alignment_detail": "Directly supports the UI modernization goal...",
-    "code_quality": 8,             // 0-10
-    "test_coverage": 4,            // 0-10
-    "architecture_fit": 9          // 0-10
-  },
-  "recommended_action": "merge",
-  "action_notes": "Merge after adding toggle persistence test"
-}
-```
-
-### Phase 4: Report — Synthesize
-
-**Goal**: Produce an actionable summary. Single agent, full context.
-
-**Output structure**:
-```markdown
-# OpenClaw PR Review Report
-**Date**: 2026-02-16 | **Total PRs scanned**: 3,127 | **Clusters found**: 203
-
-## Executive Summary
-- 3,127 open PRs analyzed across 203 distinct themes
-- 847 PRs identified as duplicates (reducible to 203 unique efforts)
-- 42 PRs recommended for immediate merge
-- 89 PRs recommended for closure (duplicates, off-vision, spam)
-
-## Recommended Actions
-
-### Merge (42 PRs)
-| PR | Title | Author | Cluster | Quality | Vision | Notes |
-|----|-------|--------|---------|---------|--------|-------|
-| #1234 | Add dark mode | alice | Dark mode (3 dupes) | 8/10 | 9/10 | Add tests first |
-
-### Close — Duplicates (847 PRs)
-| PR | Duplicate Of | Confidence |
-|----|-------------|------------|
-| #1567 | #1234 | 90% |
-| #2890 | #1234 | 90% |
-
-### Close — Off-Vision (23 PRs)
-| PR | Title | Vision Score | Reason |
-|----|-------|-------------|--------|
-| #999 | Add crypto mining | 0/10 | Completely unrelated to project |
-
-### Needs Human Review (128 PRs)
-...
-
-## Cluster Details
-### Cluster: Dark Mode (3 PRs)
-- **Best**: #1234 by alice — [detailed review]
-- **Duplicates**: #1567 (bob), #2890 (charlie)
-- **Recommendation**: Merge #1234, close others with comment linking to #1234
-```
-
----
-
-## System Architecture
-
-### Directory Structure
-
-```
-src/swarm/
-├── coordinator.ts       # Job lifecycle management
-├── phase-executor.ts    # Runs map/reduce/review phases
-├── worker-pool.ts       # Manages concurrent agent invocations
-├── batch-splitter.ts    # Splits input data into batches
-├── schema-validator.ts  # Validates worker JSON output against schemas
-├── data-store.ts        # Reads/writes phase data to disk
-├── reporter.ts          # Generates final reports
-├── retry.ts             # Retry logic for failed batches
-└── jobs/
-    └── pr-review.ts     # PR review job definition (GitHub-specific)
-
-src/swarm/prompts/
-├── pr-classifier.md     # Phase 1 system prompt
-├── pr-clusterer.md      # Phase 2 system prompt
-├── pr-reviewer.md       # Phase 3 system prompt
-└── pr-reporter.md       # Phase 4 system prompt
-```
-
-### Job Definition
+Every phase declares:
+- **Input schema**: What shape of data it expects
+- **Output schema**: What shape of data it produces
+- **Cardinality**: How inputs map to outputs (1:1, N:1, N:M, conditional)
 
 ```typescript
-interface SwarmJob {
-  id: string;
-  name: string;
-  status: 'pending' | 'ingesting' | 'running' | 'completed' | 'failed';
-  created_at: number;
-  phases: SwarmPhase[];
-  current_phase: number;
-  config: {
-    repo?: string;                    // e.g. "owner/repo"
-    vision_document?: string;         // path or inline
-    output_format: 'markdown' | 'json' | 'github-comments';
-  };
-}
-
-interface SwarmPhase {
-  name: string;
-  type: 'map' | 'reduce' | 'review' | 'report';
-  status: 'pending' | 'running' | 'completed' | 'failed';
-  config: {
-    batch_size: number;
-    concurrency: number;
-    model: string;                    // 'sonnet', 'opus', 'haiku'
-    provider: string;                 // 'anthropic', 'openai'
-    timeout_ms: number;
-    retries: number;
-    system_prompt: string;            // path to prompt file
-    input_schema?: object;            // JSON schema for validation
-    output_schema?: object;
-  };
-  progress: {
-    total_batches: number;
-    completed_batches: number;
-    failed_batches: number;
-    items_processed: number;
-  };
+interface PhaseContract {
+  input_schema: JSONSchema;
+  output_schema: JSONSchema;
+  cardinality: '1:1' | 'N:1' | 'N:M' | 'conditional';
 }
 ```
 
-### Worker Pool
+At phase boundaries, the framework validates:
+1. The previous phase's output matches the next phase's input schema
+2. Each individual worker output matches the phase's output schema
 
-The worker pool manages concurrent agent invocations with backpressure:
+If a worker produces invalid output, the framework retries with the validation error appended to the prompt. This gives the model a chance to self-correct before the batch is marked as failed.
 
-```typescript
-interface WorkerPool {
-  concurrency: number;        // max simultaneous workers
-  active: number;             // currently running
-  queue: BatchTask[];         // waiting to be processed
-  results: BatchResult[];     // completed results
-  errors: BatchError[];       // failed batches (for retry)
-}
+### Checkpointing
 
-interface BatchTask {
-  batch_id: string;
-  phase: string;
-  input: any;                 // structured JSON
-  system_prompt: string;
-  model: string;
-  timeout_ms: number;
-  attempt: number;            // retry count
-}
-
-interface BatchResult {
-  batch_id: string;
-  output: any;                // parsed JSON from agent
-  duration_ms: number;
-  tokens_used?: number;
-}
-```
-
-Key behaviors:
-- **Backpressure**: When all workers are busy, new batches wait in queue
-- **Retry**: Failed batches go back to queue with exponential backoff (max 3 retries)
-- **Timeout**: Workers that exceed timeout are killed and the batch is retried
-- **Validation**: Worker output is validated against the phase's output schema; invalid output triggers a retry with the validation error appended to the prompt
-- **Progress**: Real-time progress emitted as events (for TUI visualization)
-
-### How Workers Differ from Team Agents
-
-Team agents are **persistent** — they maintain conversation history, work in their own directory, and have a personality (SOUL.md). Swarm workers are **ephemeral**:
-
-```typescript
-// Swarm worker invocation (new function, not invokeAgent)
-async function invokeWorker(task: BatchTask): Promise<BatchResult> {
-  // Each worker gets a fresh, temporary working directory
-  const tmpDir = createTempDir(`swarm-${task.batch_id}`);
-
-  // No conversation continuity (-c flag NOT used)
-  // No SOUL.md or AGENTS.md
-  // System prompt is the phase prompt + input data
-  const prompt = `${task.system_prompt}\n\n## Input\n\`\`\`json\n${JSON.stringify(task.input)}\n\`\`\``;
-
-  const args = ['--dangerously-skip-permissions', '--model', task.model, '-p', prompt];
-
-  const result = await runCommandWithTimeout('claude', args, tmpDir, task.timeout_ms);
-
-  // Parse and validate JSON output
-  const parsed = extractJSON(result);
-  validateSchema(parsed, task.output_schema);
-
-  // Cleanup
-  removeTempDir(tmpDir);
-
-  return { batch_id: task.batch_id, output: parsed, duration_ms: elapsed };
-}
-```
-
-### Data Store
-
-Each phase writes its output to disk as JSON. This enables:
-- **Resumability**: If the job crashes, resume from the last completed phase
-- **Inspectability**: Human can review intermediate results
-- **Debugging**: Replay a single batch with modified prompts
+Every piece of state is written to disk:
 
 ```
 ~/.tinyclaw/swarm/jobs/{job_id}/
-├── job.json                          # Job definition + status
-├── data/
-│   ├── prs.json                      # Raw ingested data (Phase 0)
-│   ├── classifications.json          # Phase 1 output (all batches merged)
-│   ├── clusters.json                 # Phase 2 output
-│   ├── reviews.json                  # Phase 3 output
-│   └── report.md                     # Phase 4 output
-├── batches/
-│   ├── phase1/
-│   │   ├── batch-001-input.json
-│   │   ├── batch-001-output.json
-│   │   ├── batch-002-input.json
-│   │   ├── batch-002-output.json
-│   │   └── ...
-│   ├── phase2/
-│   └── phase3/
-├── prompts/                          # Resolved prompts used (for reproducibility)
-│   ├── phase1-system.md
-│   ├── phase2-system.md
-│   └── phase3-system.md
-└── events/                           # Swarm-specific events for TUI
-    ├── 1708099200000-phase-start.json
-    ├── 1708099201000-batch-complete.json
-    └── ...
+├── job.json                    # Job definition + current status
+├── dag.json                    # Resolved execution graph
+├── phases/
+│   ├── ingest/
+│   │   ├── phase.json          # Phase status + progress
+│   │   └── output.json         # Complete phase output
+│   ├── classify/
+│   │   ├── phase.json
+│   │   ├── output.json         # Merged output (all batches)
+│   │   └── batches/
+│   │       ├── 001-input.json
+│   │       ├── 001-output.json # Checkpoint per batch
+│   │       ├── 002-input.json
+│   │       ├── 002-output.json
+│   │       └── ...
+│   └── ...
+├── prompts/                    # Resolved prompts (for reproducibility)
+└── events/                     # Real-time event stream for TUI
+```
+
+**Resumability rules**:
+- If a job crashes, `tinyclaw swarm resume {job_id}` restarts from the last incomplete phase
+- Within a map/filter/review phase, completed batches are skipped — only incomplete batches re-run
+- Phase outputs are immutable once the phase completes — re-running a phase requires explicit `tinyclaw swarm rerun {job_id} --phase {name}`
+
+---
+
+## The Worker Pool
+
+The worker pool is the execution engine. It manages concurrent agent invocations with backpressure, retry, and cost tracking.
+
+### Concurrency Model
+
+```
+                     ┌────────────────────┐
+                     │   Phase Executor   │
+                     │                    │
+                     │  Splits items into │
+                     │  batches, submits  │
+                     │  to worker pool    │
+                     └────────┬───────────┘
+                              │
+              ┌───────────────┼───────────────┐
+              ▼               ▼               ▼
+         ┌─────────┐    ┌─────────┐    ┌─────────┐
+         │ Slot 1  │    │ Slot 2  │    │ Slot 3  │  ... (concurrency N)
+         │         │    │         │    │         │
+         │ Worker  │    │ Worker  │    │ Worker  │
+         │ running │    │ running │    │  idle   │
+         └────┬────┘    └────┬────┘    └─────────┘
+              │              │
+              ▼              ▼
+        [batch result]  [batch result]  → merged into phase output
+```
+
+When a slot finishes, the next queued batch is dispatched. This is a simple semaphore pattern — no need for complex scheduling.
+
+### Retry Strategy
+
+```
+Attempt 1: Run worker normally
+  ↓ (fail: parse error)
+Attempt 2: Re-run with validation error in prompt
+  ↓ (fail: timeout)
+Attempt 3: Re-run with increased timeout (2x)
+  ↓ (fail: any)
+Mark batch as FAILED, continue with remaining batches
+```
+
+Failed batches don't block the job. The phase completes with partial results and a list of failed batches. The user can inspect failures and either fix prompts and retry, or accept partial results.
+
+### Cost Controls
+
+```typescript
+interface CostConfig {
+  budget_usd?: number;          // Hard cap. Job pauses when reached.
+  warn_usd?: number;            // Soft cap. Emits warning event.
+  track_tokens: boolean;        // Track input/output tokens per batch
+}
+```
+
+The framework estimates token usage per batch (input size × batch_size) and tracks actual usage from API responses. If a budget is set, the job pauses before starting a batch that would exceed it.
+
+---
+
+## Adaptive Execution
+
+Not every item needs the same treatment. Adaptive execution lets the framework adjust behavior based on the data.
+
+### Model Escalation
+
+Start cheap, escalate only when needed:
+
+```yaml
+phases:
+  classify:
+    type: map
+    model: haiku              # Fast + cheap first pass
+
+  review:
+    type: review
+    model_strategy: escalate  # Dynamic model selection
+    escalation:
+      default: sonnet
+      rules:
+        - condition: "item.complexity == 'XL'"
+          model: opus
+        - condition: "item.flags.includes('security')"
+          model: opus
+```
+
+Most items get Sonnet. Only complex or security-sensitive items get Opus. This can cut costs 3-5x compared to using Opus for everything.
+
+### Dynamic Batch Sizing
+
+Simple items can be batched aggressively. Complex items need more context per item:
+
+```yaml
+phases:
+  classify:
+    type: map
+    batch_strategy: adaptive
+    batching:
+      default_size: 50
+      rules:
+        - condition: "item.diff_size > 1000"
+          batch_size: 10      # Large diffs need more context per item
+        - condition: "item.diff_size < 100"
+          batch_size: 100     # Small diffs can pack densely
+```
+
+### Conditional Phases
+
+Gate phases inspect the data and decide what happens next:
+
+```yaml
+phases:
+  triage_gate:
+    type: gate
+    conditions:
+      - if: "data.clusters.length > 500"
+        then: deep_reduce     # Too many clusters, need another reduce pass
+      - if: "data.clusters.length <= 500"
+        then: review          # Manageable, proceed to review
 ```
 
 ---
 
-## CLI Interface
+## Job Definitions
 
-```bash
-# Define and run a PR review job
-tinyclaw swarm pr-review owner/repo \
-  --vision ./VISION.md \
-  --concurrency 20 \
-  --model sonnet \
-  --output report.md
+Jobs are declared in YAML (or JSON). The framework resolves the DAG, validates contracts, and executes.
 
-# Generic swarm job from a definition file
-tinyclaw swarm run job-definition.json
+### Anatomy of a Job Definition
 
-# Check job status
-tinyclaw swarm status {job_id}
+```yaml
+name: "pr-review"
+description: "Scan, classify, de-duplicate, and review open PRs"
 
-# Resume a failed/interrupted job
-tinyclaw swarm resume {job_id}
+# Global config
+config:
+  default_model: sonnet
+  default_provider: anthropic
+  budget_usd: 50
+  output_dir: ./reports
 
-# List all jobs
-tinyclaw swarm list
+# Shared context available to all phases
+context:
+  vision_document: ./VISION.md
 
-# Live visualization
-tinyclaw swarm watch {job_id}
+# Phase definitions
+phases:
+  ingest:
+    type: ingest
+    source:
+      type: github-prs        # Built-in data source
+      repo: "owner/repo"
+      state: open
+      fields: [number, title, body, author, files, labels, ci_status]
+    output_schema: schemas/pr-metadata.json
 
-# Re-run a specific phase with modified prompts
-tinyclaw swarm rerun {job_id} --phase 2 --prompt ./new-clusterer.md
+  classify:
+    type: map
+    depends_on: [ingest]
+    batch_size: 50
+    concurrency: 20
+    model: sonnet
+    timeout_ms: 120000
+    prompt: prompts/classify.md
+    input_schema: schemas/pr-metadata.json
+    output_schema: schemas/pr-classification.json
 
-# Export results
-tinyclaw swarm export {job_id} --format json
-tinyclaw swarm export {job_id} --format markdown
-tinyclaw swarm export {job_id} --format github-comments  # post as PR comments
+  pre_cluster:
+    type: transform           # Non-AI, pure code
+    depends_on: [classify]
+    script: transforms/cluster-by-similarity.ts
+    # Groups items by overlapping files, similar titles, matching fingerprints
+
+  refine_clusters:
+    type: reduce
+    depends_on: [pre_cluster]
+    concurrency: 3            # Shard by category
+    model: sonnet
+    prompt: prompts/refine-clusters.md
+    input_schema: schemas/pre-clusters.json
+    output_schema: schemas/clusters.json
+
+  review:
+    type: review
+    depends_on: [refine_clusters]
+    batch_size: 5
+    concurrency: 10
+    model: opus
+    timeout_ms: 300000
+    prompt: prompts/deep-review.md
+    # Enrichment: fetch additional data for each item before sending to worker
+    enrich:
+      - field: diff
+        source: github-pr-diff
+    input_schema: schemas/pr-for-review.json
+    output_schema: schemas/pr-review.json
+
+  report:
+    type: report
+    depends_on: [review, refine_clusters]  # Gets both review results and cluster data
+    model: opus
+    prompt: prompts/synthesize-report.md
+    output_format: markdown
 ```
+
+### Built-in Data Sources (Ingest Phase)
+
+| Source | Description |
+|--------|-------------|
+| `github-prs` | Fetch PRs from a GitHub repo via `gh` API |
+| `github-issues` | Fetch issues from a GitHub repo |
+| `filesystem` | List files matching a glob pattern |
+| `json-file` | Read a local JSON array |
+| `csv-file` | Read a local CSV file |
+| `stdin` | Read JSON from standard input |
+
+Data sources are pluggable — new ones can be registered.
+
+### Built-in Enrichment Sources (Review Phase)
+
+| Source | Description |
+|--------|-------------|
+| `github-pr-diff` | Fetch the full diff for a PR |
+| `github-pr-comments` | Fetch all comments on a PR |
+| `file-contents` | Read file contents from disk |
+| `web-fetch` | Fetch a URL |
+
+Enrichment happens *per-item* just before the item is sent to a worker. This avoids fetching expensive data (like full diffs) for items that get filtered out in earlier phases.
+
+### Built-in Transform Scripts
+
+| Script | Description |
+|--------|-------------|
+| `cluster-by-similarity` | Group items by overlapping fields, string similarity |
+| `sort-by-field` | Sort items by a field |
+| `merge-arrays` | Merge multiple input arrays into one |
+| `pick-top-k` | Select top K items by a scoring field |
+
+Transform phases run TypeScript functions — no agent invocation, no cost, instant execution. They're the glue between AI phases.
 
 ---
 
-## TUI Visualization
+## Prompt Design
 
-Extend the existing team visualizer with a swarm view:
+Swarm prompts are different from conversational prompts. They need to be **mechanical**: precise instructions that produce parseable output.
+
+### Prompt Structure
+
+Every worker prompt follows this template:
+
+```markdown
+# Role
+
+You are a {role}. You will process a batch of {items}.
+
+# Instructions
+
+{Specific instructions for this phase.}
+
+# Context
+
+{Shared context like vision documents, rubrics, examples.}
+
+# Output Format
+
+You MUST output ONLY a JSON array. No markdown fences. No commentary.
+Each element must match this schema:
+
+{JSON schema, rendered as example}
+
+# Input
+
+{The batch data is injected here by the framework.}
+```
+
+Key principles:
+- **No conversation**: Workers don't greet, apologize, or explain. They output JSON.
+- **Schema as example**: Show a complete example object, not just a schema definition. Models produce more reliable output when they can pattern-match.
+- **Explicit enumeration**: If a field has valid values like `["bug-fix", "feature", "refactor"]`, list them all. Don't say "a category string."
+- **Failure mode**: Tell the worker what to output if it's unsure: `"If you cannot determine the category, use 'unknown'."` This prevents workers from outputting explanatory text instead of JSON.
+
+### Prompt Caching
+
+When using the Anthropic API, the system prompt + context (which is identical across all batches in a phase) can be cached. Only the batch-specific input varies. This reduces input token costs by ~90% for phases with many batches.
+
+The framework handles this automatically: the worker invocation layer separates the cacheable prefix (system prompt + context) from the variable suffix (batch input).
+
+---
+
+## Progress & Observability
+
+### Event Stream
+
+Every state change emits a JSON event to `~/.tinyclaw/swarm/jobs/{job_id}/events/`:
+
+```jsonc
+// Phase started
+{ "type": "phase_start", "phase": "classify", "total_batches": 60, "ts": 1708099200000 }
+
+// Batch completed
+{ "type": "batch_done", "phase": "classify", "batch": "017", "items": 50, "duration_ms": 23400, "ts": 1708099223000 }
+
+// Batch failed
+{ "type": "batch_fail", "phase": "classify", "batch": "012", "error": "JSON parse error", "attempt": 1, "ts": 1708099230000 }
+
+// Phase completed
+{ "type": "phase_done", "phase": "classify", "items_processed": 2950, "failed": 50, "duration_ms": 360000, "ts": 1708099560000 }
+
+// Cost update
+{ "type": "cost_update", "total_tokens": 1200000, "estimated_usd": 4.80, "ts": 1708099560000 }
+
+// Job completed
+{ "type": "job_done", "phases_completed": 5, "total_items": 3000, "total_usd": 27.30, "ts": 1708100100000 }
+```
+
+### TUI Dashboard
 
 ```
-┌─ Swarm: PR Review (job_a1b2c3) ─────────────────────────────────────────────┐
-│ Repo: openclaw/openclaw | PRs: 3,127 | Vision: VISION.md                    │
+┌─ Swarm Job: pr-review (a1b2c3) ─────────────────────────────────────────────┐
 │                                                                              │
-│ Phase 1: Scan & Classify          ████████████████████░░░░  78% (47/60)      │
-│   Workers: 20/20 active | Failed: 1 (retrying) | Avg: 23s/batch             │
+│ ✓ ingest          3,127 items                              2s               │
+│ ▶ classify         ████████████████████░░░░  78% (47/60)   ~2m left         │
+│   ○ pre_cluster    waiting                                                   │
+│   ○ refine         waiting                                                   │
+│   ○ review         waiting                                                   │
+│   ○ report         waiting                                                   │
 │                                                                              │
-│ Phase 2: Cluster & De-duplicate   ░░░░░░░░░░░░░░░░░░░░░░░░  waiting         │
-│ Phase 3: Deep Review              ░░░░░░░░░░░░░░░░░░░░░░░░  waiting         │
-│ Phase 4: Report                   ░░░░░░░░░░░░░░░░░░░░░░░░  waiting         │
+│ Workers: 18/20 active │ Retries: 2 │ Failed: 0                              │
+│ Tokens: 1.2M │ Cost: $4.80 / $50.00 budget                                 │
 │                                                                              │
-│ ┌─ Recent Activity ────────────────────────────────────────────────────────┐ │
-│ │ 14:23:01  batch-047 completed (50 PRs, 21s, sonnet)                     │ │
-│ │ 14:22:58  batch-046 completed (50 PRs, 24s, sonnet)                     │ │
-│ │ 14:22:45  batch-012 RETRY #1 (parse error, requeued)                    │ │
-│ │ 14:22:40  batch-045 completed (50 PRs, 19s, sonnet)                     │ │
+│ ┌─ Activity ───────────────────────────────────────────────────────────────┐ │
+│ │ 14:23:01  ✓ batch-047  50 items  21s  sonnet                            │ │
+│ │ 14:22:58  ✓ batch-046  50 items  24s  sonnet                            │ │
+│ │ 14:22:45  ↻ batch-012  retry #1  JSON parse error                       │ │
+│ │ 14:22:40  ✓ batch-045  50 items  19s  sonnet                            │ │
 │ └─────────────────────────────────────────────────────────────────────────┘ │
-│                                                                              │
-│ Estimated remaining: ~2 min | Tokens used: ~1.2M | Cost: ~$3.40             │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Cost Estimation
+## CLI
 
-For the 3,000 PR review job:
+```bash
+# Run a job from a definition file
+tinyclaw swarm run job.yaml
 
-| Phase | Batches | Model | Input tokens/batch | Output tokens/batch | Total tokens | Estimated cost |
-|-------|---------|-------|-------------------|---------------------|-------------|----------------|
-| 1: Classify | 60 | Sonnet | ~15K | ~5K | ~1.2M | ~$4.80 |
-| 2: Cluster | 3 | Sonnet | ~50K | ~10K | ~180K | ~$0.72 |
-| 3: Review | 40 | Opus | ~20K | ~3K | ~920K | ~$20.70 |
-| 4: Report | 1 | Opus | ~30K | ~5K | ~35K | ~$0.79 |
-| **Total** | | | | | **~2.3M** | **~$27** |
+# Run a built-in job type with flags
+tinyclaw swarm pr-review owner/repo --vision VISION.md --budget 50
 
-~$27 to review 3,000 PRs. Time: ~15 minutes end-to-end.
+# Job management
+tinyclaw swarm list                           # List all jobs
+tinyclaw swarm status {job_id}                # Show job status
+tinyclaw swarm watch {job_id}                 # Live TUI dashboard
+tinyclaw swarm resume {job_id}                # Resume from last checkpoint
+tinyclaw swarm cancel {job_id}                # Cancel a running job
 
----
+# Debugging & iteration
+tinyclaw swarm rerun {job_id} --phase classify          # Re-run one phase
+tinyclaw swarm rerun {job_id} --phase classify --batch 12  # Re-run one batch
+tinyclaw swarm inspect {job_id} --phase classify --batch 12  # View batch I/O
+tinyclaw swarm export {job_id} --format json             # Export results
 
-## Vision Document Integration
-
-The vision document is the project's north star. It tells workers what the project *should* look like, so they can flag PRs that stray.
-
-```markdown
-# OpenClaw Vision
-
-## What We Are
-- A lightweight, extensible AI agent framework
-- Focused on CLI-first workflows
-- Multi-provider (Claude, GPT, open-source)
-
-## What We Are Not
-- Not a web application framework
-- Not a chatbot platform
-- Not a model training toolkit
-
-## Architecture Principles
-- File-based communication (no databases)
-- Agent isolation via working directories
-- Minimal dependencies
-
-## Current Priorities (Q1 2026)
-1. Agent swarm / batch processing
-2. Plugin ecosystem
-3. Performance optimization
-
-## Non-Goals
-- GUI/web dashboard (CLI + TUI only)
-- Cloud hosting / SaaS
-- Model fine-tuning
-```
-
-Workers use this to:
-- Score vision alignment (0-10)
-- Flag PRs that introduce non-goals (e.g., "Add web dashboard" → 0/10)
-- Prioritize PRs that align with current priorities
-
----
-
-## Extensibility: Beyond PR Review
-
-The swarm architecture is generic. The PR review pipeline is just one job definition. Other jobs:
-
-### Issue Triage
-```
-Ingest: Fetch all open issues
-Map: Classify (bug, feature request, question, duplicate, stale)
-Reduce: Cluster by topic, link duplicates
-Report: Triage recommendations
-```
-
-### Codebase Audit
-```
-Ingest: List all source files
-Map: Analyze each file (complexity, test coverage, TODOs, security issues)
-Reduce: Aggregate by module/directory
-Report: Health report with hotspots
-```
-
-### Dependency Review
-```
-Ingest: Parse package.json / requirements.txt
-Map: Check each dependency (license, vulnerabilities, maintenance status)
-Reduce: Risk assessment
-Report: Dependency health report
-```
-
-### Documentation Gap Analysis
-```
-Ingest: List all public APIs + existing docs
-Map: Check each API for documentation coverage
-Reduce: Identify gaps
-Report: Documentation TODO list
+# Dry run — validate the DAG without executing
+tinyclaw swarm run job.yaml --dry-run
 ```
 
 ---
 
-## Implementation Plan
+## Integration with TinyClaw
 
-### Milestone 1: Core Infrastructure
-- [ ] `SwarmCoordinator` — job lifecycle (create, run, pause, resume)
-- [ ] `WorkerPool` — concurrent agent invocations with backpressure
-- [ ] `DataStore` — JSON read/write between phases
-- [ ] `SchemaValidator` — validate worker output
-- [ ] `invokeWorker()` — stateless agent invocation (no history, temp dirs)
-- [ ] CLI: `tinyclaw swarm run`, `status`, `list`
+The swarm framework lives alongside the existing team system, not replacing it.
 
-### Milestone 2: PR Review Pipeline
-- [ ] GitHub data ingestion via `gh` CLI
-- [ ] Phase 1 prompt: PR classifier
-- [ ] Phase 2 logic: programmatic pre-clustering + agent refinement
-- [ ] Phase 3 prompt: deep code reviewer
-- [ ] Phase 4 prompt: report synthesizer
-- [ ] CLI: `tinyclaw swarm pr-review`
+### Shared Infrastructure
 
-### Milestone 3: Visualization & UX
-- [ ] Swarm TUI view (progress bars, activity log, cost tracker)
-- [ ] Event emission for swarm phases
-- [ ] `tinyclaw swarm watch` command
+| Component | Teams | Swarm | Shared? |
+|-----------|-------|-------|---------|
+| Agent invocation (`invoke.ts`) | `invokeAgent()` — persistent, stateful | `invokeWorker()` — ephemeral, stateless | Shared `runCommand()` base |
+| Queue system | File-based message queue | Not used (batch executor manages its own work) | No |
+| Data format | Free text | Structured JSON | No |
+| Event system | `~/.tinyclaw/events/` | `~/.tinyclaw/swarm/jobs/{id}/events/` | Same format, different directories |
+| TUI | `team-visualizer.tsx` | `swarm-visualizer.tsx` | Shared Ink/React framework |
+| Config | `settings.json` agents/teams | `job.yaml` definitions | Agents reusable as worker configs |
 
-### Milestone 4: Resilience & Optimization
-- [ ] Batch retry with exponential backoff
-- [ ] Job resumability (resume from last completed phase/batch)
-- [ ] Prompt caching (reuse vision doc across batches)
-- [ ] Adaptive batch sizing (larger batches for simpler items)
-- [ ] Rate limiting awareness (GitHub API, model API)
+### Channel Integration
 
-### Milestone 5: Actions & Integration
-- [ ] `--output github-comments` — post reviews directly as PR comments
-- [ ] `--output github-labels` — auto-label PRs based on classification
-- [ ] `--auto-close duplicates` — close duplicate PRs with linking comment
-- [ ] Webhook trigger — run swarm job on schedule or PR threshold
-- [ ] Slack/Discord notifications on job completion
+Swarm jobs can be triggered from any channel:
+
+```
+@swarm pr-review openclaw/openclaw --vision VISION.md
+```
+
+The coordinator runs the job asynchronously and sends a summary back to the channel when complete. For long jobs, periodic progress updates can be sent.
+
+### Teams Triggering Swarms
+
+A team agent can invoke a swarm job as part of a conversation:
+
+```
+User: "@dev review all open PRs and give me a summary"
+Leader agent → recognizes this is a bulk task → triggers swarm job
+Swarm completes → result delivered back to the conversation
+```
+
+This bridges the two modes: conversational intent triggers batch execution.
+
+---
+
+## Architecture Decisions
+
+### Why a DAG, Not Just Map-Reduce
+
+MapReduce is two phases. Real workflows need more:
+- **Filter** after map (remove spam PRs before expensive review)
+- **Enrich** before review (fetch diffs only for candidates that survived filtering)
+- **Gate** for conditional branching (if too many clusters, re-reduce)
+- **Transform** for cheap code-only steps between AI phases
+
+A DAG of typed phases is the minimal abstraction that supports all of these without special-casing.
+
+### Why File-Based State, Not a Database
+
+Same philosophy as TinyClaw's queue system:
+- No setup or dependencies
+- Human-readable (you can `cat` any intermediate result)
+- Trivially resumable (check which batch files exist)
+- Git-friendly (you could commit job results)
+- Portable (copy a job directory to another machine)
+
+### Why Stateless Workers, Not Persistent Agents
+
+Persistent agents (TinyClaw team model) maintain conversation history. This is wasteful for batch work:
+- Each batch is independent — history from batch #12 doesn't help with batch #13
+- Stateless workers can be retried trivially (no corrupted state)
+- Stateless workers can run on any available slot (no affinity)
+- Lower memory footprint per worker
+
+The one exception: reduce/report phases may benefit from seeing the full context of what came before. But this is handled by the phase executor injecting the right data, not by worker statefulness.
+
+### Why Structured JSON, Not Free Text
+
+Free-text responses can't be:
+- Validated against a schema
+- Merged across batches programmatically
+- Fed as structured input to the next phase
+- Queried or filtered without another AI call
+
+JSON schemas make the pipeline mechanical. Each phase boundary is a type-checked interface.
+
+### Why Not Just Use the Anthropic Batch API Directly
+
+The Anthropic Batch API is a possible *backend* for the worker pool, but it's not a framework:
+- No phase composition or DAGs
+- No schema validation
+- No retry with error feedback
+- No intermediate checkpointing
+- No TUI visualization
+- No prompt management
+- 24h turnaround (acceptable for some jobs, not all)
+
+The swarm framework can use the Batch API as one execution backend when latency doesn't matter and cost does.
+
+---
+
+## Type Definitions
+
+```typescript
+// ─── Job ──────────────────────────────────────────────────
+
+interface SwarmJob {
+  id: string;
+  name: string;
+  description?: string;
+  status: 'pending' | 'running' | 'paused' | 'completed' | 'failed';
+  created_at: number;
+  updated_at: number;
+  config: JobConfig;
+  phases: Record<string, SwarmPhase>;
+  dag: DAGEdge[];                   // Phase dependency edges
+  current_phases: string[];          // Currently executing phase(s)
+  results?: any;                     // Final output
+  error?: string;
+}
+
+interface JobConfig {
+  default_model: string;
+  default_provider: string;
+  budget_usd?: number;
+  warn_usd?: number;
+  output_dir?: string;
+  context?: Record<string, string>; // Shared context (e.g., vision doc path)
+}
+
+interface DAGEdge {
+  from: string;                     // Phase name
+  to: string;                       // Phase name
+  condition?: string;               // Optional condition expression
+}
+
+// ─── Phase ────────────────────────────────────────────────
+
+interface SwarmPhase {
+  name: string;
+  type: 'ingest' | 'map' | 'filter' | 'reduce' | 'gate' | 'transform' | 'review' | 'report';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+  depends_on: string[];
+  config: PhaseConfig;
+  progress: PhaseProgress;
+  contract: PhaseContract;
+}
+
+interface PhaseConfig {
+  // Execution
+  batch_size?: number;              // Items per batch (map/filter/review)
+  concurrency?: number;             // Max parallel workers
+  timeout_ms?: number;              // Per-worker timeout
+  retries?: number;                 // Max retries per batch
+
+  // AI
+  model?: string;
+  provider?: string;
+  prompt?: string;                  // Path to prompt file
+  model_strategy?: 'fixed' | 'escalate';
+  escalation_rules?: EscalationRule[];
+
+  // Non-AI
+  script?: string;                  // Path to transform script
+
+  // Data
+  enrich?: EnrichmentConfig[];      // Per-item data enrichment
+  input_schema?: string;            // Path to JSON schema
+  output_schema?: string;
+
+  // Batching
+  batch_strategy?: 'fixed' | 'adaptive';
+  batch_rules?: BatchRule[];
+}
+
+interface PhaseProgress {
+  total_items: number;
+  processed_items: number;
+  total_batches: number;
+  completed_batches: number;
+  failed_batches: number;
+  tokens_used: number;
+  cost_usd: number;
+  start_time?: number;
+  end_time?: number;
+}
+
+interface PhaseContract {
+  input_schema: object;             // JSON Schema
+  output_schema: object;
+  cardinality: '1:1' | 'N:1' | 'N:M' | 'conditional';
+}
+
+// ─── Worker ───────────────────────────────────────────────
+
+interface WorkerTask {
+  task_id: string;
+  job_id: string;
+  phase: string;
+  batch_id: string;
+  input: any;
+  system_prompt: string;
+  model: string;
+  provider: string;
+  timeout_ms: number;
+  attempt: number;
+  context?: Record<string, string>; // Shared context values
+}
+
+interface WorkerResult {
+  task_id: string;
+  batch_id: string;
+  status: 'success' | 'failed';
+  output?: any;
+  error?: string;
+  duration_ms: number;
+  tokens_input?: number;
+  tokens_output?: number;
+}
+
+// ─── Supporting ───────────────────────────────────────────
+
+interface EscalationRule {
+  condition: string;                // JS expression evaluated per item
+  model: string;
+}
+
+interface BatchRule {
+  condition: string;
+  batch_size: number;
+}
+
+interface EnrichmentConfig {
+  field: string;                    // Field to add to each item
+  source: string;                   // Data source type
+  params?: Record<string, string>;  // Source-specific params
+}
+```
+
+---
+
+## Example: PR Review as a Job Definition
+
+With all the framework machinery above, the PR review pipeline is just a job definition file:
+
+```yaml
+name: pr-review
+description: Scan, classify, de-duplicate, and deep-review open PRs
+
+config:
+  default_model: sonnet
+  default_provider: anthropic
+  budget_usd: 50
+  context:
+    vision: ./VISION.md
+
+phases:
+  ingest:
+    type: ingest
+    source: { type: github-prs, repo: "owner/repo", state: open }
+
+  classify:
+    type: map
+    depends_on: [ingest]
+    batch_size: 50
+    concurrency: 20
+    model: sonnet
+    prompt: prompts/classify.md
+
+  filter_spam:
+    type: filter
+    depends_on: [classify]
+    batch_size: 100
+    concurrency: 10
+    model: haiku
+    prompt: prompts/filter-spam.md
+
+  pre_cluster:
+    type: transform
+    depends_on: [filter_spam]
+    script: transforms/cluster-by-similarity.ts
+
+  refine_clusters:
+    type: reduce
+    depends_on: [pre_cluster]
+    concurrency: 3
+    model: sonnet
+    prompt: prompts/refine-clusters.md
+
+  review:
+    type: review
+    depends_on: [refine_clusters]
+    batch_size: 5
+    concurrency: 10
+    model: opus
+    timeout_ms: 300000
+    prompt: prompts/deep-review.md
+    enrich:
+      - field: diff
+        source: github-pr-diff
+
+  report:
+    type: report
+    depends_on: [review, refine_clusters]
+    model: opus
+    prompt: prompts/synthesize-report.md
+    output_format: markdown
+```
+
+Other use cases (issue triage, codebase audit, dependency review, doc gap analysis) are just different YAML files with different prompts and schemas. The framework doesn't change.
+
+---
+
+## Implementation Milestones
+
+### M1: Core Framework
+- `SwarmCoordinator` — parse job YAML, resolve DAG, manage lifecycle
+- `PhaseExecutor` — run a single phase (batch splitting, worker dispatch, result merging)
+- `WorkerPool` — concurrent invocation with semaphore, retry, timeout
+- `invokeWorker()` — stateless Claude/Codex invocation
+- `DataStore` — checkpoint read/write per phase and batch
+- `SchemaValidator` — validate worker output, produce error feedback for retry
+- CLI: `tinyclaw swarm run`, `status`, `resume`, `list`
+
+### M2: Built-in Data Sources & Transforms
+- Ingest sources: `github-prs`, `github-issues`, `filesystem`, `json-file`
+- Enrichment sources: `github-pr-diff`, `github-pr-comments`, `file-contents`
+- Transform scripts: `cluster-by-similarity`, `sort-by-field`, `pick-top-k`
+- CLI: `tinyclaw swarm pr-review` (built-in job template)
+
+### M3: Adaptive Execution
+- Model escalation (per-item model selection based on rules)
+- Dynamic batch sizing
+- Gate phases (conditional routing)
+- Cost tracking and budget enforcement
+
+### M4: Visualization
+- Swarm TUI dashboard (React/Ink)
+- Real-time progress, activity log, cost tracker
+- CLI: `tinyclaw swarm watch`
+
+### M5: Actions & Integration
+- GitHub output: post PR comments, apply labels, close duplicates
+- Channel integration: trigger swarm from Discord/Telegram/WhatsApp
+- Webhook/cron triggers
+- Anthropic Batch API as alternative worker backend
 
 ---
 
 ## Open Questions
 
-1. **Anthropic Batch API**: Claude has a batch API that processes requests asynchronously at 50% cost. Should we support this as an alternative to real-time worker invocations? Trade-off: cheaper but slower (up to 24h turnaround). For 3,000 PRs this would cut costs from ~$27 to ~$14.
+1. **Worker backend**: CLI subprocess (`claude -p`) vs Agent SDK (`@anthropic-ai/claude-code` as library) vs raw API (`@anthropic-ai/sdk`). CLI is simplest but has subprocess overhead. Agent SDK gives tool use. Raw API is fastest but no tool use. Should the framework support all three, or pick one?
 
-2. **Embedding-based dedup**: For Phase 2 pre-clustering, should we use text embeddings (e.g., `voyage-3-large`) for semantic similarity instead of/in addition to string heuristics? More accurate but adds a dependency and cost.
+2. **Prompt versioning**: When you iterate on a prompt and re-run a phase, should the framework track prompt versions? This would let you diff results across prompt changes — useful for prompt engineering at scale.
 
-3. **Human-in-the-loop checkpoints**: Should certain phases pause for human review before proceeding? E.g., review the clusters before running expensive deep reviews. The infrastructure supports this (phases are independent), but the UX needs design.
+3. **Streaming results**: Should the report phase wait for all reviews, or start generating as reviews complete? Streaming would give faster time-to-first-result but complicates the DAG model.
 
-4. **Multi-repo support**: The PR review pipeline assumes a single repo. Should the job definition support multiple repos in one run? This would help organizations managing many related repos.
+4. **Multi-model composition within a batch**: Could a single batch use multiple models? E.g., Haiku for initial classification, Sonnet for items Haiku was uncertain about? This is micro-level escalation vs the current phase-level escalation.
 
-5. **Agent SDK vs CLI invocation**: Currently `invokeWorker()` calls the Claude CLI as a subprocess. For high-concurrency swarm work, the [Claude Agent SDK](https://github.com/anthropics/claude-code/tree/main/packages/agent) (`@anthropic-ai/claude-code`) might be more efficient — it runs Claude Code as a library with direct API calls, avoiding subprocess overhead. Worth investigating for Milestone 4.
+5. **Shared memory between workers**: In rare cases, workers might benefit from seeing other workers' results (e.g., "this PR was already classified as a duplicate of #X by another worker"). This breaks the stateless model. Is it worth supporting as an opt-in?
