@@ -5,7 +5,7 @@
  * Unlike teams (collaborative), swarms handle data parallelism:
  * processing many similar items concurrently via map-reduce.
  *
- * Flow: Input → Split → Map (parallel batches) → Reduce → Output
+ * Flow: Input → Split → Map (parallel batches) → Shuffle (optional) → Reduce → Output
  */
 
 /**
@@ -56,6 +56,45 @@ export interface SwarmConfig {
     /** Prompt template for each batch. {{items}} = batch items, {{batch_index}} = batch number, {{total_batches}} = total */
     prompt_template: string;
 
+    /**
+     * Optional shuffle phase between map and reduce.
+     * Like MapReduce's shuffle, this re-groups map outputs by key before reduction,
+     * ensuring related items (e.g., potential duplicates) end up in the same reduce partition.
+     *
+     * Without shuffle: map results go directly to reducer (fine for aggregation tasks).
+     * With shuffle: map results are parsed, grouped by key, then each group is reduced
+     * independently before a final merge (required for cross-referencing tasks like dedup).
+     */
+    shuffle?: {
+        /** Field name to extract as partition key from JSON map output (e.g., "tags", "key_files") */
+        key_field: string;
+
+        /**
+         * How to handle items with array-valued keys (e.g., tags: ["auth", "bugfix"]):
+         *   'duplicate' — item appears in ALL matching partitions (ensures no missed pairs)
+         *   'first'     — item goes into only the first key's partition
+         * Default: 'duplicate'
+         */
+        multi_key?: 'duplicate' | 'first';
+
+        /**
+         * Maximum number of items per partition before sub-splitting.
+         * Very popular keys (e.g., "bugfix" appearing in 500 PRs) get split
+         * into sub-partitions to stay within context limits.
+         * Default: 200
+         */
+        max_partition_size?: number;
+
+        /**
+         * Prompt for reducing each partition. {{partition_key}} = the key value,
+         * {{items}} = all items in this partition. If not set, uses the main reduce.prompt.
+         */
+        reduce_prompt?: string;
+
+        /** Prompt for the final merge of all partition results */
+        merge_prompt?: string;
+    };
+
     /** How to aggregate batch results */
     reduce?: {
         /** 'concatenate' = join results, 'summarize' = agent summarizes, 'hierarchical' = tree reduction */
@@ -99,7 +138,7 @@ export interface SwarmJob {
     id: string;
     swarmId: string;
     config: SwarmConfig;
-    status: 'initializing' | 'fetching_input' | 'splitting' | 'processing' | 'reducing' | 'completed' | 'failed';
+    status: 'initializing' | 'fetching_input' | 'splitting' | 'processing' | 'shuffling' | 'reducing' | 'completed' | 'failed';
     batches: SwarmBatch[];
     progress: SwarmProgress;
     /** Raw input items before batching */
@@ -143,4 +182,6 @@ export const SWARM_DEFAULTS = {
     max_items: 10000,
     /** Max batch results to feed into a single reduce step */
     hierarchical_reduce_fanin: 20,
+    /** Default max items per shuffle partition */
+    max_partition_size: 200,
 };

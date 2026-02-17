@@ -14,6 +14,8 @@ Swarms are ideal for tasks that involve processing many similar items:
 
 ## Architecture
 
+### Standard Pipeline (aggregation tasks)
+
 ```
 User Message → @swarm_id
          ↓
@@ -30,7 +32,6 @@ User Message → @swarm_id
     ┌─────────────┐     ┌──────────┐
     │  Worker      │────→│ Worker 1 │──→ Batch result 1
     │  Pool        │────→│ Worker 2 │──→ Batch result 2
-    │              │────→│ Worker 3 │──→ Batch result 3
     │  (parallel)  │────→│ ...      │──→ ...
     │              │────→│ Worker N │──→ Batch result N
     └──────┬──────┘     └──────────┘
@@ -41,6 +42,39 @@ User Message → @swarm_id
            ↓
     Final Response → User
 ```
+
+### Shuffle Pipeline (cross-referencing tasks like dedup)
+
+When items must be compared across batches, enable the **shuffle** phase. Like MapReduce's shuffle, this re-groups map outputs by key before reduction — guaranteeing that related items (potential duplicates, conflicting changes) land in the same reduce partition.
+
+```
+    ┌─────────────┐     ┌──────────┐
+    │  Worker      │────→│ Worker 1 │──→ [{pr:42, tags:["auth"]}, ...]
+    │  Pool        │────→│ Worker 2 │──→ [{pr:1876, tags:["auth"]}, ...]
+    │  (Map)       │────→│ Worker N │──→ [...]
+    └──────┬──────┘     └──────────┘
+           ↓
+    ┌─────────────┐
+    │  Shuffle     │  Group by key field (e.g., "tags")
+    │              │  "auth" → [PR#42, PR#1876, PR#99, ...]
+    │              │  "bugfix" → [PR#42, PR#55, ...]
+    │              │  "refactor" → [PR#200, PR#3001, ...]
+    └──────┬──────┘
+           ↓
+    ┌─────────────┐     ┌──────────────┐
+    │  Partition   │────→│ "auth" group │──→ "Duplicates: #42 ↔ #1876"
+    │  Reduce      │────→│ "bugfix" grp │──→ "Duplicates: #42 ↔ #55"
+    │  (parallel)  │────→│ "refactor"   │──→ "No duplicates"
+    └──────┬──────┘     └──────────────┘
+           ↓
+    ┌─────────────┐
+    │  Final Merge │  Deduplicate findings across partitions
+    └──────┬──────┘
+           ↓
+    Final Response → User
+```
+
+**Why shuffle solves the cross-batch problem:** Without shuffle, PR#42 (in batch 3) and PR#1876 (in batch 95) are never compared — they live in different batch results that get summarized independently. With shuffle, both PRs share the tag "auth", so they're grouped into the same partition and the reducer sees them side by side.
 
 ## Quick Start
 
@@ -117,6 +151,12 @@ Items: 3000 | Batches: 120 (118 ok, 2 failed) | Workers: 10
 | `reduce.strategy` | string | `"concatenate"` | `"concatenate"`, `"summarize"`, or `"hierarchical"` |
 | `reduce.prompt` | string | — | Custom prompt for summarize/hierarchical reduction |
 | `reduce.agent` | string | — | Agent ID for reduction (defaults to swarm agent) |
+| `shuffle` | object | — | Optional shuffle phase for cross-referencing tasks |
+| `shuffle.key_field` | string | required | JSON field to partition by (e.g., `"tags"`, `"key_files"`) |
+| `shuffle.multi_key` | string | `"duplicate"` | For array keys: `"duplicate"` puts item in all partitions, `"first"` uses first key only |
+| `shuffle.max_partition_size` | number | 200 | Split oversized partitions into sub-partitions |
+| `shuffle.reduce_prompt` | string | — | Prompt for each partition (supports `{{partition_key}}`, `{{items}}`, `{{item_count}}`) |
+| `shuffle.merge_prompt` | string | — | Prompt for final merge of partition results |
 | `progress_interval` | number | 10 | Send progress updates every N batches (0 = none) |
 
 ### Prompt Template Placeholders
@@ -169,6 +209,20 @@ The `input.command` runs automatically:
 @pr-reviewer review PRs from `gh pr list --repo owner/repo --limit 100 --json number,title`
 ```
 
+## When to Use Shuffle
+
+| Task Type | Needs Shuffle? | Why |
+|-----------|---------------|-----|
+| **Summarize** all PRs | No | Each batch summary is independent |
+| **Find duplicates** across PRs | **Yes** | Duplicates may be in different batches |
+| **Rank/sort** all items | No | Reduce can merge pre-sorted batch results |
+| **Find conflicts** between items | **Yes** | Conflicting items may be in different batches |
+| **Aggregate counts** (e.g., PRs by author) | No | Counts from each batch can be summed |
+| **Find patterns** across items | **Yes** | Patterns require seeing related items together |
+| **Classify** each item independently | No | Each item classified on its own |
+
+**Rule of thumb:** If the task requires comparing items against each other (not just processing each independently), you need shuffle.
+
 ## Reduce Strategies
 
 ### Concatenate (default)
@@ -190,6 +244,42 @@ Level 2: 10 summaries → 1 final report
 ```
 
 ## Examples
+
+### PR Duplicate Finder (with shuffle)
+
+This example demonstrates the shuffle phase for cross-batch comparison:
+
+```json
+{
+  "pr-dedup": {
+    "name": "PR Duplicate Finder",
+    "agent": "coder",
+    "concurrency": 10,
+    "batch_size": 50,
+    "input": {
+      "command": "gh pr list --repo {{repo}} --state open --limit 5000 --json number,title,url,body,headRefName,files,additions,deletions",
+      "type": "json_array"
+    },
+    "prompt_template": "For each PR, extract a structured fingerprint for duplicate detection. Output ONLY a JSON array where each entry has:\n- pr_number (number)\n- title (string)\n- intent (1-sentence summary of what this PR does)\n- key_files (array of primary files changed)\n- tags (3-5 semantic keywords, e.g. 'auth', 'bugfix', 'api', 'refactor')\n\nPRs (batch {{batch_number}}/{{total_batches}}):\n{{items}}",
+    "shuffle": {
+      "key_field": "tags",
+      "multi_key": "duplicate",
+      "max_partition_size": 200,
+      "reduce_prompt": "Find duplicate and near-duplicate PRs among these {{item_count}} items that share the tag \"{{partition_key}}\".\n\nCompare by: similar intent, overlapping key_files, similar titles.\n\nFor each duplicate pair/group, output:\n- PR numbers involved\n- Why they're duplicates\n- Which to keep (newest, most complete, or most reviewed)\n\nIf no duplicates found, say 'No duplicates in this partition.'\n\n{{items}}",
+      "merge_prompt": "Below are duplicate detection results from multiple partitions. Some duplicates may appear in multiple partitions (because PRs share multiple tags). Merge into a single deduplicated report:\n\n## Exact Duplicates\n(PRs doing the same thing)\n\n## Near Duplicates\n(Significant overlap, should consolidate)\n\n## Conflicting PRs\n(Same files, incompatible changes)\n\nFor each group: list PR numbers/titles, explain relationship, recommend action (close/merge/keep)."
+    },
+    "reduce": {
+      "strategy": "summarize"
+    }
+  }
+}
+```
+
+**How it works:**
+1. **Map**: 10 workers extract compact fingerprints from 50 PRs each (60 batches)
+2. **Shuffle**: Fingerprints re-grouped by `tags` — all "auth" PRs together, all "bugfix" PRs together, etc. PRs with multiple tags appear in multiple partitions (`multi_key: "duplicate"`)
+3. **Partition Reduce**: Each tag group checked for duplicates independently (parallel)
+4. **Final Merge**: Duplicate findings from all partitions merged and deduplicated
 
 ### PR Review Swarm
 ```json

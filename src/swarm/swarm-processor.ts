@@ -1,7 +1,7 @@
 /**
  * Swarm Processor — Main orchestrator for agent swarm jobs.
  *
- * Pipeline: Input Resolution → Batch Splitting → Worker Pool (Map) → Reducer → Output
+ * Pipeline: Input Resolution → Batch Splitting → Worker Pool (Map) → Shuffle (optional) → Reducer → Output
  *
  * The swarm processor runs as part of the queue processor. When a message is
  * routed to a swarm (via @swarm_id), processSwarmJob() is called instead of
@@ -17,6 +17,7 @@ import { SwarmConfig, SwarmJob, SwarmJobContext, SWARM_DEFAULTS } from './types'
 import { resolveInputItems, splitIntoBatches } from './batch-splitter';
 import { processAllBatches, WorkerPoolOptions } from './worker-pool';
 import { reduceBatchResults, ReduceOptions } from './reducer';
+import { shuffleByKey, shuffleReducePartitions, ShuffleReduceOptions } from './shuffle';
 
 /** Active swarm jobs — for status queries and progress tracking */
 const activeJobs = new Map<string, SwarmJob>();
@@ -185,27 +186,77 @@ export async function processSwarmJob(
             log('WARN', `Swarm ${jobId}: ${failedCount}/${batches.length} batches failed`);
         }
 
-        // --- Phase 4: Reduce ---
-        job.status = 'reducing';
-        log('INFO', `Swarm ${jobId}: reducing ${successResults.length} batch results...`);
+        // --- Phase 4: Shuffle (optional) + Reduce ---
+        let finalResult: string;
 
-        if (successResults.length > 1) {
-            sendProgressUpdate(context, `**${config.name}**: All batches complete. Aggregating results...`);
+        if (config.shuffle) {
+            // Shuffle-reduce path: re-partition map outputs by key, then
+            // reduce each partition independently, then merge.
+            // This guarantees cross-batch comparison for tasks like dedup.
+            job.status = 'shuffling';
+            log('INFO', `Swarm ${jobId}: shuffling ${successResults.length} batch results by key "${config.shuffle.key_field}"...`);
+            sendProgressUpdate(context, `**${config.name}**: All batches complete. Shuffling results by "${config.shuffle.key_field}"...`);
+
+            const shuffleResult = shuffleByKey(successResults, config);
+
+            emitEvent('swarm_shuffle_done', {
+                jobId,
+                swarmId,
+                partitions: shuffleResult.partitions.size,
+                totalItems: shuffleResult.totalItems,
+                unkeyedItems: shuffleResult.unkeyed.length,
+                duplicatedItems: shuffleResult.duplicatedItems,
+            });
+
+            sendProgressUpdate(
+                context,
+                `**${config.name}**: Shuffled into **${shuffleResult.partitions.size}** partitions ` +
+                `(${shuffleResult.totalItems} items` +
+                (shuffleResult.duplicatedItems > 0 ? `, ${shuffleResult.duplicatedItems} cross-partition` : '') +
+                `). Reducing partitions...`
+            );
+
+            job.status = 'reducing';
+            const concurrency = config.concurrency || SWARM_DEFAULTS.concurrency;
+
+            const shuffleReduceOpts: ShuffleReduceOptions = {
+                swarmId,
+                jobId,
+                config,
+                agent,
+                agentId,
+                workspacePath,
+                agents,
+                teams,
+                userMessage,
+                concurrency,
+            };
+
+            finalResult = await shuffleReducePartitions(shuffleResult, shuffleReduceOpts);
+        } else {
+            // Standard reduce path (no shuffle)
+            job.status = 'reducing';
+            log('INFO', `Swarm ${jobId}: reducing ${successResults.length} batch results...`);
+
+            if (successResults.length > 1) {
+                sendProgressUpdate(context, `**${config.name}**: All batches complete. Aggregating results...`);
+            }
+
+            const reduceOptions: ReduceOptions = {
+                swarmId,
+                jobId,
+                config,
+                agent,
+                agentId,
+                workspacePath,
+                agents,
+                teams,
+                userMessage,
+            };
+
+            finalResult = await reduceBatchResults(successResults, reduceOptions);
         }
 
-        const reduceOptions: ReduceOptions = {
-            swarmId,
-            jobId,
-            config,
-            agent,
-            agentId,
-            workspacePath,
-            agents,
-            teams,
-            userMessage,
-        };
-
-        const finalResult = await reduceBatchResults(successResults, reduceOptions);
         job.result = finalResult;
 
         // --- Phase 5: Output ---
