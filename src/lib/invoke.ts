@@ -170,7 +170,7 @@ export async function invokeAgent(
         if (continueConversation) {
             claudeArgs.push('-c');
         }
-        claudeArgs.push('-p', message);
+        claudeArgs.push('-p', '--', message);
 
         return await runCommand('claude', claudeArgs, workingDir);
     }
