@@ -601,6 +601,9 @@ emitEvent('processor_start', { agents: Object.keys(getAgents(getSettings())), te
 // Process queue every 1 second
 setInterval(processQueue, 1000);
 
+// Recover stuck messages from processing/ every 60 seconds
+setInterval(recoverOrphanedFiles, 60000);
+
 // Graceful shutdown
 process.on('SIGINT', () => {
     log('INFO', 'Shutting down queue processor...');

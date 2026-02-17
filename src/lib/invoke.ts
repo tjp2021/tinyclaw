@@ -6,7 +6,7 @@ import { SCRIPT_DIR, resolveClaudeModel, resolveCodexModel, resolveOpenCodeModel
 import { log } from './logging';
 import { ensureAgentDirectory, updateAgentTeammates } from './agent-setup';
 
-export async function runCommand(command: string, args: string[], cwd?: string): Promise<string> {
+export async function runCommand(command: string, args: string[], cwd?: string, timeoutMs: number = 300000): Promise<string> {
     return new Promise((resolve, reject) => {
         const child = spawn(command, args, {
             cwd: cwd || SCRIPT_DIR,
@@ -15,6 +15,13 @@ export async function runCommand(command: string, args: string[], cwd?: string):
 
         let stdout = '';
         let stderr = '';
+        let killed = false;
+
+        const timer = setTimeout(() => {
+            killed = true;
+            child.kill('SIGKILL');
+            reject(new Error(`Command timed out after ${timeoutMs / 1000}s`));
+        }, timeoutMs);
 
         child.stdout.setEncoding('utf8');
         child.stderr.setEncoding('utf8');
@@ -28,10 +35,13 @@ export async function runCommand(command: string, args: string[], cwd?: string):
         });
 
         child.on('error', (error) => {
-            reject(error);
+            clearTimeout(timer);
+            if (!killed) reject(error);
         });
 
         child.on('close', (code) => {
+            clearTimeout(timer);
+            if (killed) return;
             if (code === 0) {
                 resolve(stdout);
                 return;
@@ -163,7 +173,7 @@ export async function invokeAgent(
         }
 
         const modelId = resolveClaudeModel(agent.model);
-        const claudeArgs = ['--allow-dangerously-skip-permissions'];
+        const claudeArgs = ['--dangerously-skip-permissions'];
         if (modelId) {
             claudeArgs.push('--model', modelId);
         }
