@@ -86,6 +86,56 @@ export function ensureAgentDirectory(agentDir: string): void {
     if (fs.existsSync(sourceSoul)) {
         fs.copyFileSync(sourceSoul, path.join(targetTinyclaw, 'SOUL.md'));
     }
+
+    // Create memory directory structure
+    const memoryDir = path.join(agentDir, 'memory');
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.mkdirSync(path.join(memoryDir, 'skills'), { recursive: true });
+
+    // Seed empty memory files if they don't exist
+    const knowledgeFile = path.join(memoryDir, 'knowledge.md');
+    if (!fs.existsSync(knowledgeFile)) {
+        fs.writeFileSync(knowledgeFile, '# Knowledge\n\n_No entries yet. This file will be updated as I learn._\n');
+    }
+    const reflectionsFile = path.join(memoryDir, 'reflections.jsonl');
+    if (!fs.existsSync(reflectionsFile)) {
+        fs.writeFileSync(reflectionsFile, '');
+    }
+    const episodesFile = path.join(memoryDir, 'episodes.jsonl');
+    if (!fs.existsSync(episodesFile)) {
+        fs.writeFileSync(episodesFile, '');
+    }
+    const skillsIndex = path.join(memoryDir, 'skills', 'index.json');
+    if (!fs.existsSync(skillsIndex)) {
+        fs.writeFileSync(skillsIndex, '{}');
+    }
+}
+
+/**
+ * Ensure memory directory exists for an agent's working directory.
+ * Called on every invocation (not just first-time setup) so existing agents get memory too.
+ */
+export function ensureMemoryDirectory(workingDir: string): void {
+    const memoryDir = path.join(workingDir, 'memory');
+    fs.mkdirSync(memoryDir, { recursive: true });
+    fs.mkdirSync(path.join(memoryDir, 'skills'), { recursive: true });
+
+    const knowledgeFile = path.join(memoryDir, 'knowledge.md');
+    if (!fs.existsSync(knowledgeFile)) {
+        fs.writeFileSync(knowledgeFile, '# Knowledge\n\n_No entries yet. This file will be updated as I learn._\n');
+    }
+    const reflectionsFile = path.join(memoryDir, 'reflections.jsonl');
+    if (!fs.existsSync(reflectionsFile)) {
+        fs.writeFileSync(reflectionsFile, '');
+    }
+    const episodesFile = path.join(memoryDir, 'episodes.jsonl');
+    if (!fs.existsSync(episodesFile)) {
+        fs.writeFileSync(episodesFile, '');
+    }
+    const skillsIndex = path.join(memoryDir, 'skills', 'index.json');
+    if (!fs.existsSync(skillsIndex)) {
+        fs.writeFileSync(skillsIndex, '{}');
+    }
 }
 
 /**

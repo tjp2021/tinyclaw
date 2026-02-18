@@ -24,18 +24,7 @@ import {
 } from './lib/config';
 import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
-import { invokeAgent } from './lib/invoke';
-import { jsonrepair } from 'jsonrepair';
-
-/** Parse JSON with automatic repair for malformed content (e.g. bad escapes). */
-function safeParseJSON<T = unknown>(raw: string, label?: string): T {
-    try {
-        return JSON.parse(raw);
-    } catch {
-        log('WARN', `Invalid JSON${label ? ` in ${label}` : ''}, attempting auto-repair`);
-        return JSON.parse(jsonrepair(raw));
-    }
-}
+import { invokeAgent, runCommand } from './lib/invoke';
 
 // Ensure directories exist
 [QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING, FILES_DIR, path.dirname(LOG_FILE)].forEach(dir => {
@@ -75,6 +64,59 @@ function handleLongResponse(
     const preview = response.substring(0, LONG_RESPONSE_THRESHOLD) + '\n\n_(Full response attached as file)_';
 
     return { message: preview, files: [...existingFiles, filePath] };
+}
+
+/**
+ * Capture an episode summary after a conversation completes.
+ * Sends a lightweight summarization request to Claude and appends to episodes.jsonl.
+ * Runs in the background — does not block response delivery.
+ */
+async function captureEpisode(
+    workingDir: string,
+    sender: string,
+    userMessage: string,
+    agentResponse: string,
+    agentId: string
+): Promise<void> {
+    try {
+        const episodesFile = path.join(workingDir, 'memory', 'episodes.jsonl');
+        if (!fs.existsSync(path.dirname(episodesFile))) return;
+
+        // Truncate inputs to keep the summarization prompt small
+        const truncatedMessage = userMessage.substring(0, 500);
+        const truncatedResponse = agentResponse.substring(0, 1000);
+
+        const summaryPrompt = `Summarize this conversation in 1-2 sentences and provide 3-5 keyword tags. Respond ONLY with valid JSON in this exact format, no other text:
+{"summary": "...", "tags": ["tag1", "tag2", "tag3"], "outcome": "resolved|unresolved|informational"}
+
+User message: ${truncatedMessage}
+
+Agent response: ${truncatedResponse}`;
+
+        const summaryResult = await runCommand('claude', [
+            '--dangerously-skip-permissions',
+            '--model', 'claude-haiku-4-5',
+            '-p', summaryPrompt,
+        ], workingDir);
+
+        // Parse the JSON response
+        const jsonMatch = summaryResult.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const episode = {
+                ts: new Date().toISOString(),
+                user: sender,
+                agent: agentId,
+                summary: parsed.summary || 'No summary',
+                tags: parsed.tags || [],
+                outcome: parsed.outcome || 'unknown',
+            };
+            fs.appendFileSync(episodesFile, JSON.stringify(episode) + '\n');
+            log('INFO', `Episode captured for agent ${agentId}: ${episode.summary.substring(0, 80)}`);
+        }
+    } catch (error) {
+        log('ERROR', `Failed to capture episode: ${(error as Error).message}`);
+    }
 }
 
 // Recover orphaned files from processing/ on startup (crash recovery)
@@ -226,6 +268,18 @@ function completeConversation(conv: Conversation): void {
     log('INFO', `✓ Response ready [${conv.channel}] ${conv.sender} (${finalResponse.length} chars)`);
     emitEvent('response_ready', { channel: conv.channel, sender: conv.sender, responseLength: finalResponse.length, responseText: finalResponse, messageId: conv.messageId });
 
+    // Capture episode for each agent that participated (background, non-blocking)
+    const workspacePath = settings?.workspace?.path || path.join(require('os').homedir(), 'tinyclaw-workspace');
+    for (const step of conv.responses) {
+        const stepAgent = agents[step.agentId];
+        if (stepAgent) {
+            const agentWorkDir = stepAgent.working_directory
+                ? (path.isAbsolute(stepAgent.working_directory) ? stepAgent.working_directory : path.join(workspacePath, stepAgent.working_directory))
+                : path.join(workspacePath, step.agentId);
+            captureEpisode(agentWorkDir, conv.sender, conv.originalMessage, step.response, step.agentId).catch(() => {});
+        }
+    }
+
     // Clean up
     conversations.delete(conv.id);
 }
@@ -239,7 +293,7 @@ async function processMessage(messageFile: string): Promise<void> {
         fs.renameSync(messageFile, processingFile);
 
         // Read message
-        const messageData: MessageData = safeParseJSON(fs.readFileSync(processingFile, 'utf8'), path.basename(processingFile));
+        const messageData: MessageData = JSON.parse(fs.readFileSync(processingFile, 'utf8'));
         const { channel, sender, message: rawMessage, timestamp, messageId } = messageData;
         const isInternal = !!messageData.conversationId;
 
@@ -358,8 +412,7 @@ async function processMessage(messageFile: string): Promise<void> {
             response = await invokeAgent(agent, agentId, message, workspacePath, shouldReset, agents, teams);
         } catch (error) {
             const provider = agent.provider || 'anthropic';
-            const providerLabel = provider === 'openai' ? 'Codex' : provider === 'opencode' ? 'OpenCode' : 'Claude';
-            log('ERROR', `${providerLabel} error (agent: ${agentId}): ${(error as Error).message}`);
+            log('ERROR', `${provider === 'openai' ? 'Codex' : 'Claude'} error (agent: ${agentId}): ${(error as Error).message}`);
             response = "Sorry, I encountered an error processing your request. Please check the queue logs.";
         }
 
@@ -399,6 +452,12 @@ async function processMessage(messageFile: string): Promise<void> {
 
             log('INFO', `✓ Response ready [${channel}] ${sender} via agent:${agentId} (${finalResponse.length} chars)`);
             emitEvent('response_ready', { channel, sender, agentId, responseLength: finalResponse.length, responseText: finalResponse, messageId });
+
+            // Capture episode in background (non-blocking)
+            const soloWorkingDir = agent.working_directory
+                ? (path.isAbsolute(agent.working_directory) ? agent.working_directory : path.join(workspacePath, agent.working_directory))
+                : path.join(workspacePath, agentId);
+            captureEpisode(soloWorkingDir, sender, rawMessage, finalResponse, agentId).catch(() => {});
 
             fs.unlinkSync(processingFile);
             return;
@@ -493,7 +552,7 @@ const agentProcessingChains = new Map<string, Promise<void>>();
  */
 function peekAgentId(filePath: string): string {
     try {
-        const messageData = safeParseJSON<MessageData>(fs.readFileSync(filePath, 'utf8'));
+        const messageData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
         const settings = getSettings();
         const agents = getAgents(settings);
         const teams = getTeams(settings);
@@ -600,9 +659,6 @@ emitEvent('processor_start', { agents: Object.keys(getAgents(getSettings())), te
 
 // Process queue every 1 second
 setInterval(processQueue, 1000);
-
-// Recover stuck messages from processing/ every 60 seconds
-setInterval(recoverOrphanedFiles, 60000);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
