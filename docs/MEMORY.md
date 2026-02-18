@@ -186,6 +186,38 @@ Memory directories are created automatically when an agent directory is initiali
 - `memory/episodes.jsonl` — Empty file
 - `memory/skills/index.json` — Empty JSON object `{}`
 
+## Testing
+
+Run the test suite:
+
+```bash
+# Unit tests (fast, no Claude invocation)
+npm test
+
+# Live integration tests (invokes Claude, slower)
+npm run test:live
+
+# All tests
+npm run test:all
+```
+
+### Unit Tests (`tests/memory.test.ts`)
+
+Tests memory loading logic without invoking Claude:
+- Directory creation
+- Knowledge loading (including placeholder detection)
+- Reflections parsing
+- Episodes keyword matching
+- Skills matching
+- Full context injection
+
+### Live Tests (`tests/memory-live.test.ts`)
+
+Actually invokes Claude to test end-to-end:
+- Ask agent to remember a fact → verify knowledge.md updated
+- New session with memory injection → verify recall works
+- Reflection capture
+
 ## Performance Notes
 
 - Episode capture uses claude-haiku-4-5 for fast, cheap summarization

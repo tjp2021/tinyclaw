@@ -10,7 +10,10 @@
     "discord": "node dist/channels/discord-client.js",
     "telegram": "node dist/channels/telegram-client.js",
     "queue": "node dist/queue-processor.js",
-    "visualize": "node dist/visualizer/team-visualizer.js"
+    "visualize": "node dist/visualizer/team-visualizer.js",
+    "test": "npx ts-node tests/memory.test.ts",
+    "test:live": "npx ts-node tests/memory-live.test.ts",
+    "test:all": "npm run test && npm run test:live"
   },
   "dependencies": {
     "@types/react": "^19.2.14",
@@ -29,6 +32,7 @@
     "@types/node": "^25.2.2",
     "@types/node-telegram-bot-api": "^0.64.13",
     "@types/qrcode-terminal": "^0.12.2",
+    "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }
 }
