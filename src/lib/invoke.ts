@@ -5,6 +5,7 @@ import { AgentConfig, TeamConfig } from './types';
 import { SCRIPT_DIR, resolveClaudeModel, resolveCodexModel } from './config';
 import { log } from './logging';
 import { ensureAgentDirectory, ensureMemoryDirectory, updateAgentTeammates } from './agent-setup';
+import { classifyPrompt } from 'mcp-thinkgate';
 
 /**
  * Load memory context from an agent's working directory.
@@ -254,6 +255,25 @@ export async function invokeAgent(
         if (continueConversation) {
             claudeArgs.push('-c');
         }
+
+        // ThinkGate: auto-classify prompt complexity and set --effort accordingly
+        const apiKey = process.env.ANTHROPIC_API_KEY;
+        if (apiKey) {
+            try {
+                const classification = await classifyPrompt(message, apiKey);
+                const effortMap: Record<string, string> = {
+                    fast: 'low',
+                    think: 'medium',
+                    ultrathink: 'high',
+                };
+                const effort = effortMap[classification.tier];
+                claudeArgs.push('--effort', effort);
+                log('INFO', `ThinkGate [${agentId}]: ${classification.tier} → --effort ${effort} | ${classification.reasoning}`);
+            } catch (err) {
+                log('WARN', `ThinkGate classification failed, using default effort: ${(err as Error).message}`);
+            }
+        }
+
         claudeArgs.push('-p', message);
 
         return await runCommand('claude', claudeArgs, workingDir);
