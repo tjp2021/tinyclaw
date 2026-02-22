@@ -201,6 +201,24 @@ export async function invokeAgent(
 
     const provider = agent.provider || 'anthropic';
 
+    if (provider === 'mac') {
+        log('INFO', `Using MacBook Claude Code via SSH (agent: ${agentId})`);
+
+        const CLAUDE_PATH = '/opt/homebrew/bin/claude';
+        const modelId = resolveClaudeModel(agent.model) || 'claude-opus-4-6';
+        // Base64-encode the message to avoid all shell injection / quoting issues
+        const b64 = Buffer.from(message).toString('base64');
+        const remoteCmd = `export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" && PROMPT=$(printf '%s' '${b64}' | base64 -d) && ${CLAUDE_PATH} --dangerously-skip-permissions --model ${modelId} -p "$PROMPT"`;
+
+        return await runCommand('ssh', [
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'ConnectTimeout=30',
+            '-o', 'IdentitiesOnly=yes',
+            'tim@100.114.149.44',
+            remoteCmd,
+        ], workingDir);
+    }
+
     if (provider === 'openai') {
         log('INFO', `Using Codex CLI (agent: ${agentId})`);
 
