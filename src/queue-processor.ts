@@ -25,13 +25,29 @@ import {
 import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
 import { invokeAgent, runCommand } from './lib/invoke';
+import { buildConfirmInstruction, detectConfirmRequired, buildApprovalMessage, parseApprovalReply } from './lib/approval';
+
+const QUEUE_APPROVAL = path.join(path.dirname(QUEUE_INCOMING), 'approval');
 
 // Ensure directories exist
-[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING, FILES_DIR, path.dirname(LOG_FILE)].forEach(dir => {
+[QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING, QUEUE_APPROVAL, FILES_DIR, path.dirname(LOG_FILE)].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
 });
+
+interface ApprovalState {
+    agentId: string;
+    senderId: string;
+    channel: string;
+    sender: string;
+    messageId: string;
+    originalMessage: string;
+    description: string;
+    workspacePath: string;
+    agentWorkingDir: string;
+    timestamp: number;
+}
 
 // Files currently queued in a promise chain — prevents duplicate processing across ticks
 const queuedFiles = new Set<string>();
@@ -117,6 +133,52 @@ Agent response: ${truncatedResponse}`;
     } catch (error) {
         log('ERROR', `Failed to capture episode: ${(error as Error).message}`);
     }
+}
+
+/**
+ * Save approval state to queue/approval/{senderId}.json
+ */
+function saveApprovalState(state: ApprovalState): void {
+    const stateFile = path.join(QUEUE_APPROVAL, `${state.senderId}.json`);
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+    log('INFO', `Approval state saved for sender ${state.senderId}: ${state.description}`);
+}
+
+/**
+ * Load approval state for a sender. Returns null if none pending.
+ */
+function loadApprovalState(senderId: string): ApprovalState | null {
+    const stateFile = path.join(QUEUE_APPROVAL, `${senderId}.json`);
+    if (!fs.existsSync(stateFile)) return null;
+    try {
+        return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Delete approval state for a sender.
+ */
+function clearApprovalState(senderId: string): void {
+    const stateFile = path.join(QUEUE_APPROVAL, `${senderId}.json`);
+    if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
+}
+
+/**
+ * Write a direct response to outgoing queue (used for approval messages and rejections).
+ */
+function writeDirectResponse(channel: string, sender: string, senderId: string, messageId: string, message: string): void {
+    const responseData: ResponseData = {
+        channel,
+        sender,
+        message,
+        originalMessage: '',
+        timestamp: Date.now(),
+        messageId,
+    };
+    const responseFile = path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
+    fs.writeFileSync(responseFile, JSON.stringify(responseData, null, 2));
 }
 
 // Recover orphaned files from processing/ on startup (crash recovery)
@@ -296,10 +358,57 @@ async function processMessage(messageFile: string): Promise<void> {
         const messageData: MessageData = JSON.parse(fs.readFileSync(processingFile, 'utf8'));
         const { channel, sender, message: rawMessage, timestamp, messageId } = messageData;
         const isInternal = !!messageData.conversationId;
+        const senderId = messageData.senderId || sender;
 
         log('INFO', `Processing [${isInternal ? 'internal' : channel}] ${isInternal ? `@${messageData.fromAgent}→@${messageData.agent}` : `from ${sender}`}: ${rawMessage.substring(0, 50)}...`);
         if (!isInternal) {
             emitEvent('message_received', { channel, sender, message: rawMessage.substring(0, 120), messageId });
+        }
+
+        // --- Approval reply check (only for external, non-internal messages) ---
+        if (!isInternal && senderId) {
+            const pendingApproval = loadApprovalState(senderId);
+            if (pendingApproval) {
+                const decision = parseApprovalReply(rawMessage);
+                if (decision === 'approved') {
+                    log('INFO', `Approval granted by ${sender} for: ${pendingApproval.description}`);
+                    clearApprovalState(senderId);
+
+                    // Re-invoke the agent with --continue to proceed with the approved action
+                    const settings = getSettings();
+                    const agents = getAgents(settings);
+                    const teams = getTeams(settings);
+                    const approvedAgent = agents[pendingApproval.agentId];
+                    if (approvedAgent) {
+                        let approvedResponse: string;
+                        try {
+                            approvedResponse = await invokeAgent(
+                                approvedAgent,
+                                pendingApproval.agentId,
+                                `The user approved the action: "${pendingApproval.description}". Please proceed.`,
+                                pendingApproval.workspacePath,
+                                false, // continue conversation
+                                agents,
+                                teams
+                            );
+                        } catch (err) {
+                            approvedResponse = `Error executing approved action: ${(err as Error).message}`;
+                        }
+                        writeDirectResponse(channel, sender, senderId, messageId, approvedResponse);
+                    } else {
+                        writeDirectResponse(channel, sender, senderId, messageId, 'Approved, but agent is no longer available.');
+                    }
+                    fs.unlinkSync(processingFile);
+                    return;
+                } else if (decision === 'denied') {
+                    log('INFO', `Approval denied by ${sender} for: ${pendingApproval.description}`);
+                    clearApprovalState(senderId);
+                    writeDirectResponse(channel, sender, senderId, messageId, `🚫 Cancelled. Action aborted: ${pendingApproval.description}`);
+                    fs.unlinkSync(processingFile);
+                    return;
+                }
+                // Not an approval reply — fall through to normal processing
+            }
         }
 
         // Get settings, agents, and teams
@@ -405,11 +514,14 @@ async function processMessage(messageFile: string): Promise<void> {
             }
         }
 
+        // Prepend approval gate instruction for non-internal messages
+        const messageWithConfirmInstruction = isInternal ? message : buildConfirmInstruction() + message;
+
         // Invoke agent
         emitEvent('chain_step_start', { agentId, agentName: agent.name, fromAgent: messageData.fromAgent || null });
         let response: string;
         try {
-            response = await invokeAgent(agent, agentId, message, workspacePath, shouldReset, agents, teams);
+            response = await invokeAgent(agent, agentId, messageWithConfirmInstruction, workspacePath, shouldReset, agents, teams);
         } catch (error) {
             const provider = agent.provider || 'anthropic';
             log('ERROR', `${provider === 'openai' ? 'Codex' : 'Claude'} error (agent: ${agentId}): ${(error as Error).message}`);
@@ -417,6 +529,36 @@ async function processMessage(messageFile: string): Promise<void> {
         }
 
         emitEvent('chain_step_done', { agentId, agentName: agent.name, responseLength: response.length, responseText: response });
+
+        // --- Approval gate check ---
+        if (!isInternal) {
+            const confirmDescription = detectConfirmRequired(response);
+            if (confirmDescription) {
+                log('INFO', `CONFIRM_REQUIRED detected for agent ${agentId}: ${confirmDescription}`);
+
+                const approvalState: ApprovalState = {
+                    agentId,
+                    senderId,
+                    channel,
+                    sender,
+                    messageId,
+                    originalMessage: rawMessage,
+                    description: confirmDescription,
+                    workspacePath,
+                    agentWorkingDir: agent.working_directory
+                        ? (path.isAbsolute(agent.working_directory) ? agent.working_directory : path.join(workspacePath, agent.working_directory))
+                        : path.join(workspacePath, agentId),
+                    timestamp: Date.now(),
+                };
+                saveApprovalState(approvalState);
+
+                const approvalMessage = buildApprovalMessage(agentId, confirmDescription, rawMessage);
+                writeDirectResponse(channel, sender, senderId, messageId, approvalMessage);
+
+                fs.unlinkSync(processingFile);
+                return;
+            }
+        }
 
         // --- No team context: simple response to user ---
         if (!teamContext) {
