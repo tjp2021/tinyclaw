@@ -1,8 +1,10 @@
 export interface AgentConfig {
     name: string;
-    provider: string;       // 'anthropic', 'openai', or 'opencode'
+    provider: string;       // 'anthropic', 'openai', 'opencode', or 'mac'
     model: string;           // e.g. 'sonnet', 'opus', 'gpt-5.3-codex'
     working_directory: string;
+    aliases?: string[];      // additional routing names (case-insensitive)
+    description?: string;    // human-readable description
 }
 
 export interface TeamConfig {

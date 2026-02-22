@@ -155,6 +155,13 @@ export function parseAgentRouting(
             }
         }
 
+        // Match by agent aliases (case-insensitive)
+        for (const [id, config] of Object.entries(agents)) {
+            if (config.aliases && config.aliases.some(a => a.toLowerCase() === candidateId)) {
+                return { agentId: id, message: match[2] };
+            }
+        }
+
         // Match by team name (case-insensitive)
         for (const [, config] of Object.entries(teams)) {
             if (config.name.toLowerCase() === candidateId) {
