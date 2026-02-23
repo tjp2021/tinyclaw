@@ -208,10 +208,9 @@ export async function invokeAgent(
         const modelId = resolveClaudeModel(agent.model) || 'claude-opus-4-6';
         // Base64-encode the message to avoid all shell injection / quoting issues
         const b64 = Buffer.from(message).toString('base64');
-        // Use a consistent session dir on MacBook so -c continues the conversation
+        // Use -p (stateless) — conversation history is injected by queue-processor
         const SESSION_DIR = '/Users/tim/tinyclaw-sessions';
-        const continueFlag = shouldReset ? '' : '-c';
-        const remoteCmd = `export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" && mkdir -p ${SESSION_DIR} && cd ${SESSION_DIR} && PROMPT=$(printf '%s' '${b64}' | base64 -d) && ${CLAUDE_PATH} --dangerously-skip-permissions --model ${modelId} ${continueFlag} -p "$PROMPT"`;
+        const remoteCmd = `export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" && mkdir -p ${SESSION_DIR} && cd ${SESSION_DIR} && PROMPT=$(printf '%s' '${b64}' | base64 -d) && ${CLAUDE_PATH} --dangerously-skip-permissions --model ${modelId} -p "$PROMPT"`;
 
         return await runCommand('ssh', [
             '-o', 'StrictHostKeyChecking=no',

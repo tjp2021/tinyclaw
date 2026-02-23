@@ -56,6 +56,44 @@ const queuedFiles = new Set<string>();
 // Active conversations — tracks in-flight team message passing
 const conversations = new Map<string, Conversation>();
 
+// Per-sender chat history for context injection — survives across messages
+// Key: `${senderId}:${agentId}`, Value: array of {role, content} pairs
+interface HistoryEntry { role: 'user' | 'assistant'; content: string; }
+const chatHistory = new Map<string, HistoryEntry[]>();
+const MAX_HISTORY_ENTRIES = 10; // last 5 exchanges (10 turns)
+const MAX_HISTORY_CHARS = 6000; // cap total injected history size
+
+function getHistory(senderId: string, agentId: string): HistoryEntry[] {
+    return chatHistory.get(`${senderId}:${agentId}`) || [];
+}
+
+function addToHistory(senderId: string, agentId: string, role: 'user' | 'assistant', content: string): void {
+    const key = `${senderId}:${agentId}`;
+    const history = chatHistory.get(key) || [];
+    history.push({ role, content: content.substring(0, 2000) }); // cap per-entry size
+    // Keep only last MAX_HISTORY_ENTRIES
+    if (history.length > MAX_HISTORY_ENTRIES) history.splice(0, history.length - MAX_HISTORY_ENTRIES);
+    chatHistory.set(key, history);
+}
+
+function buildHistoryPrefix(history: HistoryEntry[]): string {
+    if (history.length === 0) return '';
+    let block = '[RECENT CONVERSATION HISTORY]\n';
+    let totalChars = 0;
+    // Walk backwards so we include the most recent turns first (up to char limit)
+    const toInclude: HistoryEntry[] = [];
+    for (let i = history.length - 1; i >= 0; i--) {
+        totalChars += history[i].content.length;
+        if (totalChars > MAX_HISTORY_CHARS) break;
+        toInclude.unshift(history[i]);
+    }
+    for (const entry of toInclude) {
+        block += `${entry.role === 'user' ? 'Tim' : 'Assistant'}: ${entry.content}\n`;
+    }
+    block += '[END HISTORY]\n\n';
+    return block;
+}
+
 const MAX_CONVERSATION_MESSAGES = 50;
 const TELEGRAM_MAX_CHARS = 4000; // Telegram limit is 4096, leave headroom
 
@@ -617,7 +655,17 @@ async function processMessage(messageFile: string): Promise<void> {
         }
 
         // Prepend approval gate instruction for non-internal messages
-        const messageWithConfirmInstruction = isInternal ? message : buildConfirmInstruction() + message;
+        // Also inject recent conversation history so context survives restarts
+        let messageWithConfirmInstruction: string;
+        if (isInternal) {
+            messageWithConfirmInstruction = message;
+        } else {
+            const history = getHistory(senderId, agentId);
+            const historyPrefix = buildHistoryPrefix(history);
+            messageWithConfirmInstruction = buildConfirmInstruction() + historyPrefix + message;
+            // Store this user message in history
+            addToHistory(senderId, agentId, 'user', rawMessage);
+        }
 
         // Invoke agent
         emitEvent('chain_step_start', { agentId, agentName: agent.name, fromAgent: messageData.fromAgent || null });
@@ -631,6 +679,11 @@ async function processMessage(messageFile: string): Promise<void> {
             // Return actual error to user so they can diagnose from phone
             const preview = errMsg.length > 400 ? errMsg.substring(0, 400) + '…' : errMsg;
             response = `⚠️ Agent error (${agentId}): ${preview}`;
+        }
+
+        // Store assistant response in history (for external messages only)
+        if (!isInternal) {
+            addToHistory(senderId, agentId, 'assistant', response);
         }
 
         emitEvent('chain_step_done', { agentId, agentName: agent.name, responseLength: response.length, responseText: response });
