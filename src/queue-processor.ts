@@ -16,6 +16,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { MessageData, ResponseData, QueueFile, ChainStep, Conversation, TeamConfig } from './lib/types';
 import {
     QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING,
@@ -346,6 +347,72 @@ function completeConversation(conv: Conversation): void {
     conversations.delete(conv.id);
 }
 
+const PROCESS_START_TIME = Date.now();
+
+/**
+ * Build a health report for the /status command.
+ * Runs fast checks: env, SSH reachability, recent errors.
+ */
+async function buildStatusReport(): Promise<string> {
+    const lines: string[] = ['📊 *TinyClaw Status*', ''];
+
+    // Uptime
+    const uptimeSec = Math.floor((Date.now() - PROCESS_START_TIME) / 1000);
+    const h = Math.floor(uptimeSec / 3600);
+    const m = Math.floor((uptimeSec % 3600) / 60);
+    const s = uptimeSec % 60;
+    lines.push(`⏱ Uptime: ${h}h ${m}m ${s}s`);
+
+    // ANTHROPIC_API_KEY
+    const hasKey = !!process.env.ANTHROPIC_API_KEY;
+    lines.push(`🔑 ANTHROPIC_API_KEY: ${hasKey ? '✅ set' : '❌ MISSING'}`);
+
+    // SSH to MacBook
+    try {
+        execSync('ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes tim@100.114.149.44 echo pong', { timeout: 8000 });
+        lines.push('💻 MacBook SSH: ✅ reachable');
+    } catch {
+        lines.push('💻 MacBook SSH: ❌ unreachable (Tailscale down? MacBook asleep?)');
+    }
+
+    // Claude on MacBook
+    try {
+        execSync('ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o BatchMode=yes tim@100.114.149.44 "/opt/homebrew/bin/claude --version"', { timeout: 10000 });
+        lines.push('🤖 Claude on MacBook: ✅ accessible');
+    } catch {
+        lines.push('🤖 Claude on MacBook: ❌ not accessible');
+    }
+
+    // Recent errors from log
+    try {
+        const logFile = path.join(path.dirname(LOG_FILE), 'queue.log');
+        if (fs.existsSync(logFile)) {
+            const logContent = fs.readFileSync(logFile, 'utf8');
+            const errorLines = logContent.split('\n')
+                .filter(l => l.includes('[ERROR]'))
+                .slice(-3);
+            if (errorLines.length > 0) {
+                lines.push('');
+                lines.push('🚨 Recent errors:');
+                errorLines.forEach(l => lines.push(`  ${l.substring(0, 120)}`));
+            } else {
+                lines.push('🚨 Recent errors: none');
+            }
+        }
+    } catch {
+        // skip
+    }
+
+    // Agents
+    const settings = getSettings();
+    const agents = getAgents(settings);
+    lines.push('');
+    lines.push(`👾 Agents: ${Object.keys(agents).join(', ')}`);
+    lines.push(`🎯 Default: ${Object.keys(agents)[0]}`);
+
+    return lines.join('\n');
+}
+
 // Process a single message
 async function processMessage(messageFile: string): Promise<void> {
     const processingFile = path.join(QUEUE_PROCESSING, path.basename(messageFile));
@@ -363,6 +430,14 @@ async function processMessage(messageFile: string): Promise<void> {
         log('INFO', `Processing [${isInternal ? 'internal' : channel}] ${isInternal ? `@${messageData.fromAgent}→@${messageData.agent}` : `from ${sender}`}: ${rawMessage.substring(0, 50)}...`);
         if (!isInternal) {
             emitEvent('message_received', { channel, sender, message: rawMessage.substring(0, 120), messageId });
+        }
+
+        // --- Built-in /status command (no agent needed) ---
+        if (!isInternal && /^\/?(status|ping|health)$/i.test(rawMessage.trim())) {
+            const statusMsg = await buildStatusReport();
+            writeDirectResponse(channel, sender, senderId, messageId, statusMsg);
+            fs.unlinkSync(processingFile);
+            return;
         }
 
         // --- Approval reply check (only for external, non-internal messages) ---
@@ -524,8 +599,11 @@ async function processMessage(messageFile: string): Promise<void> {
             response = await invokeAgent(agent, agentId, messageWithConfirmInstruction, workspacePath, shouldReset, agents, teams);
         } catch (error) {
             const provider = agent.provider || 'anthropic';
-            log('ERROR', `${provider === 'openai' ? 'Codex' : 'Claude'} error (agent: ${agentId}): ${(error as Error).message}`);
-            response = "Sorry, I encountered an error processing your request. Please check the queue logs.";
+            const errMsg = (error as Error).message;
+            log('ERROR', `${provider === 'openai' ? 'Codex' : 'Claude'} error (agent: ${agentId}): ${errMsg}`);
+            // Return actual error to user so they can diagnose from phone
+            const preview = errMsg.length > 400 ? errMsg.substring(0, 400) + '…' : errMsg;
+            response = `⚠️ Agent error (${agentId}): ${preview}`;
         }
 
         emitEvent('chain_step_done', { agentId, agentName: agent.name, responseLength: response.length, responseText: response });
