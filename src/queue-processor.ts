@@ -57,30 +57,57 @@ const queuedFiles = new Set<string>();
 const conversations = new Map<string, Conversation>();
 
 const MAX_CONVERSATION_MESSAGES = 50;
-const LONG_RESPONSE_THRESHOLD = 4000;
+const TELEGRAM_MAX_CHARS = 4000; // Telegram limit is 4096, leave headroom
 
 /**
- * If a response exceeds the threshold, save full text as a .md file
- * and return a truncated preview with the file attached.
+ * Split a response into Telegram-safe chunks at natural boundaries.
+ * Returns array of strings, each under TELEGRAM_MAX_CHARS.
+ */
+function splitIntoChunks(text: string): string[] {
+    if (text.length <= TELEGRAM_MAX_CHARS) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > TELEGRAM_MAX_CHARS) {
+        let splitAt = TELEGRAM_MAX_CHARS;
+
+        // Try to split at a paragraph boundary
+        const paraBreak = remaining.lastIndexOf('\n\n', TELEGRAM_MAX_CHARS);
+        if (paraBreak > TELEGRAM_MAX_CHARS * 0.5) {
+            splitAt = paraBreak + 2;
+        } else {
+            // Fall back to newline
+            const lineBreak = remaining.lastIndexOf('\n', TELEGRAM_MAX_CHARS);
+            if (lineBreak > TELEGRAM_MAX_CHARS * 0.5) {
+                splitAt = lineBreak + 1;
+            }
+        }
+
+        chunks.push(remaining.substring(0, splitAt).trimEnd());
+        remaining = remaining.substring(splitAt).trimStart();
+    }
+
+    if (remaining.length > 0) chunks.push(remaining);
+    return chunks;
+}
+
+/**
+ * If a response exceeds Telegram's limit, split into multiple chunks.
+ * Returns the first chunk as message, rest queued as additional parts.
+ * No more file attachments for long text — just split it.
  */
 function handleLongResponse(
     response: string,
     existingFiles: string[]
-): { message: string; files: string[] } {
-    if (response.length <= LONG_RESPONSE_THRESHOLD) {
-        return { message: response, files: existingFiles };
+): { message: string; files: string[]; extraChunks?: string[] } {
+    const chunks = splitIntoChunks(response);
+    if (chunks.length === 1) {
+        return { message: chunks[0], files: existingFiles };
     }
 
-    // Save full response as a .md file
-    const filename = `response_${Date.now()}.md`;
-    const filePath = path.join(FILES_DIR, filename);
-    fs.writeFileSync(filePath, response);
-    log('INFO', `Long response (${response.length} chars) saved to ${filename}`);
-
-    // Truncate to preview
-    const preview = response.substring(0, LONG_RESPONSE_THRESHOLD) + '\n\n_(Full response attached as file)_';
-
-    return { message: preview, files: [...existingFiles, filePath] };
+    log('INFO', `Long response (${response.length} chars) split into ${chunks.length} chunks`);
+    return { message: chunks[0], files: existingFiles, extraChunks: chunks.slice(1) };
 }
 
 /**
@@ -650,8 +677,8 @@ async function processMessage(messageFile: string): Promise<void> {
                 finalResponse = finalResponse.replace(/\[send_file:\s*[^\]]+\]/g, '').trim();
             }
 
-            // Handle long responses — send as file attachment
-            const { message: responseMessage, files: allFiles } = handleLongResponse(finalResponse, outboundFiles);
+            // Handle long responses — split into multiple messages
+            const { message: responseMessage, files: allFiles, extraChunks } = handleLongResponse(finalResponse, outboundFiles);
 
             const responseData: ResponseData = {
                 channel,
@@ -669,6 +696,25 @@ async function processMessage(messageFile: string): Promise<void> {
                 : path.join(QUEUE_OUTGOING, `${channel}_${messageId}_${Date.now()}.json`);
 
             fs.writeFileSync(responseFile, JSON.stringify(responseData, null, 2));
+
+            // Write extra chunks as follow-up messages (sequential timestamps)
+            if (extraChunks && extraChunks.length > 0 && channel !== 'heartbeat') {
+                extraChunks.forEach((chunk, i) => {
+                    const chunkData: ResponseData = {
+                        channel, sender,
+                        message: chunk,
+                        originalMessage: '',
+                        timestamp: Date.now() + i + 1,
+                        messageId: `${messageId}_chunk${i + 2}`,
+                        agent: agentId,
+                    };
+                    fs.writeFileSync(
+                        path.join(QUEUE_OUTGOING, `${channel}_${messageId}_chunk${i + 2}_${Date.now() + i + 1}.json`),
+                        JSON.stringify(chunkData, null, 2)
+                    );
+                });
+                log('INFO', `Split into ${(extraChunks?.length ?? 0) + 1} messages`);
+            }
 
             log('INFO', `✓ Response ready [${channel}] ${sender} via agent:${agentId} (${finalResponse.length} chars)`);
             emitEvent('response_ready', { channel, sender, agentId, responseLength: finalResponse.length, responseText: finalResponse, messageId });
