@@ -286,6 +286,23 @@ bot.on('message', async (msg: TelegramBot.Message) => {
 
         // Determine message text and any media files
         let messageText = msg.text || msg.caption || '';
+
+        // Include quoted/replied-to message content so the agent has full context
+        if ((msg as any).reply_to_message) {
+            const replied = (msg as any).reply_to_message;
+            const repliedText = replied.text || replied.caption || '';
+            if (repliedText) {
+                messageText = `[Quoted message: "${repliedText.substring(0, 500)}"]\n${messageText}`;
+            }
+        }
+
+        // Include forwarded message content
+        if ((msg as any).forward_from || (msg as any).forward_from_chat || (msg as any).forward_date) {
+            // Forward context is already in msg.text/caption, but label it
+            if (messageText && !(messageText.startsWith('[Forwarded'))) {
+                messageText = `[Forwarded message]\n${messageText}`;
+            }
+        }
         const downloadedFiles: string[] = [];
         const queueMessageId = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
