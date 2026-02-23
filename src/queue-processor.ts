@@ -27,6 +27,7 @@ import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
 import { invokeAgent, runCommand } from './lib/invoke';
 import { buildConfirmInstruction, detectConfirmRequired, buildApprovalMessage, parseApprovalReply } from './lib/approval';
+import { storeMemory, searchMemory } from './lib/supermemory';
 
 const QUEUE_APPROVAL = path.join(path.dirname(QUEUE_INCOMING), 'approval');
 
@@ -655,15 +656,18 @@ async function processMessage(messageFile: string): Promise<void> {
         }
 
         // Prepend approval gate instruction for non-internal messages
-        // Also inject recent conversation history so context survives restarts
+        // Inject recent conversation history + Supermemory relevant memories
         let messageWithConfirmInstruction: string;
         if (isInternal) {
             messageWithConfirmInstruction = message;
         } else {
+            // Recent turns (in-memory, fast)
             const history = getHistory(senderId, agentId);
             const historyPrefix = buildHistoryPrefix(history);
-            messageWithConfirmInstruction = buildConfirmInstruction() + historyPrefix + message;
-            // Store this user message in history
+            // Relevant long-term memories (Supermemory, async)
+            const memoryPrefix = await searchMemory(senderId, rawMessage);
+            messageWithConfirmInstruction = buildConfirmInstruction() + memoryPrefix + historyPrefix + message;
+            // Store this user message in recent history
             addToHistory(senderId, agentId, 'user', rawMessage);
         }
 
@@ -684,6 +688,8 @@ async function processMessage(messageFile: string): Promise<void> {
         // Store assistant response in history (for external messages only)
         if (!isInternal) {
             addToHistory(senderId, agentId, 'assistant', response);
+            // Persist to Supermemory in background (non-blocking)
+            storeMemory(senderId, agentId, rawMessage, response).catch(() => {});
         }
 
         emitEvent('chain_step_done', { agentId, agentName: agent.name, responseLength: response.length, responseText: response });
