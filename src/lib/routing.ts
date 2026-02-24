@@ -134,7 +134,8 @@ export function parseAgentRouting(
         };
     }
 
-    const match = rawMessage.match(/^@(\S+)\s+([\s\S]*)$/);
+    // Match with or without leading @
+    const match = rawMessage.match(/^@?(\S+)\s+([\s\S]*)$/);
     if (match) {
         const candidateId = match[1].toLowerCase();
 

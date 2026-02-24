@@ -158,6 +158,46 @@ function testMultilineMessages() {
     assert(result.message.includes('here are the details'), 'preserves multiline content');
 }
 
+function testNoAtSign() {
+    console.log(`\n${COLORS.cyan}## No @ sign required${COLORS.reset}`);
+
+    // Agent ID without @
+    const r1 = parseAgentRouting('pepe what is up', agents, teams);
+    assert(r1.agentId === 'pepe', 'pepe (no @) → pepe');
+    assert(r1.message === 'what is up', 'strips bare agent prefix');
+
+    // Alias without @
+    const r2 = parseAgentRouting('mac fix this bug', agents, teams);
+    assert(r2.agentId === 'mac-claude', 'mac (no @) → mac-claude');
+    assert(r2.message === 'fix this bug', 'strips bare alias prefix');
+
+    const r3 = parseAgentRouting('laptop check the logs', agents, teams);
+    assert(r3.agentId === 'mac-claude', 'laptop (no @) → mac-claude');
+
+    const r4 = parseAgentRouting('coder write a test', agents, teams);
+    assert(r4.agentId === 'mac-claude', 'coder (no @) → mac-claude');
+
+    const r5 = parseAgentRouting('macbook what files are here', agents, teams);
+    assert(r5.agentId === 'mac-claude', 'macbook (no @) → mac-claude');
+
+    // Case-insensitive without @
+    const r6 = parseAgentRouting('MAC fix this', agents, teams);
+    assert(r6.agentId === 'mac-claude', 'MAC (uppercase, no @) → mac-claude');
+
+    // Unrecognized first word still falls to default
+    const r7 = parseAgentRouting('just a normal message', agents, teams);
+    assert(r7.agentId === 'default', 'unknown first word → default (no false routing)');
+
+    // Single-word message (no space) → default
+    const r8 = parseAgentRouting('hello', agents, teams);
+    assert(r8.agentId === 'default', 'single word with no body → default');
+
+    // Voice-to-text style: no punctuation, no @
+    const r9 = parseAgentRouting('mac what time is it in tokyo right now', agents, teams);
+    assert(r9.agentId === 'mac-claude', 'natural voice message routes correctly');
+    assert(r9.message === 'what time is it in tokyo right now', 'voice message body correct');
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -173,6 +213,7 @@ async function main() {
     testTeamMatch();
     testDefaultFallback();
     testMultilineMessages();
+    testNoAtSign();
 
     console.log(`\n${COLORS.cyan}========================================${COLORS.reset}`);
     console.log(`Results: ${COLORS.green}${passed} passed${COLORS.reset}, ${failed > 0 ? '\x1b[31m' : ''}${failed} failed\x1b[0m`);
