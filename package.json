@@ -15,7 +15,8 @@
     "test:live": "npx ts-node tests/memory-live.test.ts",
     "test:approval": "npx ts-node tests/approval.test.ts",
     "test:routing": "npx ts-node tests/routing.test.ts",
-    "test:all": "npm run test && npm run test:approval && npm run test:routing"
+    "test:queue": "npx ts-node tests/queue.test.ts",
+    "test:all": "npm run test && npm run test:approval && npm run test:routing && npm run test:queue"
   },
   "dependencies": {
     "@types/react": "^19.2.14",

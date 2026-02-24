@@ -28,6 +28,10 @@ import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammate
 import { invokeAgent, runCommand } from './lib/invoke';
 import { buildConfirmInstruction, detectConfirmRequired, buildApprovalMessage, parseApprovalReply } from './lib/approval';
 import { storeMemory, searchMemory } from './lib/supermemory';
+import {
+    splitIntoChunks, buildHistoryPrefix, addToHistory, getHistory, collectFiles,
+    MAX_HISTORY_ENTRIES, MAX_HISTORY_CHARS, HistoryEntry,
+} from './lib/queue-utils';
 
 const QUEUE_APPROVAL = path.join(path.dirname(QUEUE_INCOMING), 'approval');
 
@@ -59,77 +63,11 @@ const conversations = new Map<string, Conversation>();
 
 // Per-sender chat history for context injection — survives across messages
 // Key: `${senderId}:${agentId}`, Value: array of {role, content} pairs
-interface HistoryEntry { role: 'user' | 'assistant'; content: string; }
 const chatHistory = new Map<string, HistoryEntry[]>();
-const MAX_HISTORY_ENTRIES = 10; // last 5 exchanges (10 turns)
-const MAX_HISTORY_CHARS = 6000; // cap total injected history size
-
-function getHistory(senderId: string, agentId: string): HistoryEntry[] {
-    return chatHistory.get(`${senderId}:${agentId}`) || [];
-}
-
-function addToHistory(senderId: string, agentId: string, role: 'user' | 'assistant', content: string): void {
-    const key = `${senderId}:${agentId}`;
-    const history = chatHistory.get(key) || [];
-    history.push({ role, content: content.substring(0, 2000) }); // cap per-entry size
-    // Keep only last MAX_HISTORY_ENTRIES
-    if (history.length > MAX_HISTORY_ENTRIES) history.splice(0, history.length - MAX_HISTORY_ENTRIES);
-    chatHistory.set(key, history);
-}
-
-function buildHistoryPrefix(history: HistoryEntry[]): string {
-    if (history.length === 0) return '';
-    let block = '[RECENT CONVERSATION HISTORY]\n';
-    let totalChars = 0;
-    // Walk backwards so we include the most recent turns first (up to char limit)
-    const toInclude: HistoryEntry[] = [];
-    for (let i = history.length - 1; i >= 0; i--) {
-        totalChars += history[i].content.length;
-        if (totalChars > MAX_HISTORY_CHARS) break;
-        toInclude.unshift(history[i]);
-    }
-    for (const entry of toInclude) {
-        block += `${entry.role === 'user' ? 'Tim' : 'Assistant'}: ${entry.content}\n`;
-    }
-    block += '[END HISTORY]\n\n';
-    return block;
-}
+// MAX_HISTORY_ENTRIES and MAX_HISTORY_CHARS imported from queue-utils
 
 const MAX_CONVERSATION_MESSAGES = 50;
-const TELEGRAM_MAX_CHARS = 4000; // Telegram limit is 4096, leave headroom
-
-/**
- * Split a response into Telegram-safe chunks at natural boundaries.
- * Returns array of strings, each under TELEGRAM_MAX_CHARS.
- */
-function splitIntoChunks(text: string): string[] {
-    if (text.length <= TELEGRAM_MAX_CHARS) return [text];
-
-    const chunks: string[] = [];
-    let remaining = text;
-
-    while (remaining.length > TELEGRAM_MAX_CHARS) {
-        let splitAt = TELEGRAM_MAX_CHARS;
-
-        // Try to split at a paragraph boundary
-        const paraBreak = remaining.lastIndexOf('\n\n', TELEGRAM_MAX_CHARS);
-        if (paraBreak > TELEGRAM_MAX_CHARS * 0.5) {
-            splitAt = paraBreak + 2;
-        } else {
-            // Fall back to newline
-            const lineBreak = remaining.lastIndexOf('\n', TELEGRAM_MAX_CHARS);
-            if (lineBreak > TELEGRAM_MAX_CHARS * 0.5) {
-                splitAt = lineBreak + 1;
-            }
-        }
-
-        chunks.push(remaining.substring(0, splitAt).trimEnd());
-        remaining = remaining.substring(splitAt).trimStart();
-    }
-
-    if (remaining.length > 0) chunks.push(remaining);
-    return chunks;
-}
+// splitIntoChunks imported from queue-utils
 
 /**
  * If a response exceeds Telegram's limit, split into multiple chunks.
@@ -287,17 +225,7 @@ function enqueueInternalMessage(
     log('INFO', `Enqueued internal message: @${fromAgent} → @${targetAgent}`);
 }
 
-/**
- * Collect files from a response text.
- */
-function collectFiles(response: string, fileSet: Set<string>): void {
-    const fileRegex = /\[send_file:\s*([^\]]+)\]/g;
-    let match: RegExpExecArray | null;
-    while ((match = fileRegex.exec(response)) !== null) {
-        const filePath = match[1].trim();
-        if (fs.existsSync(filePath)) fileSet.add(filePath);
-    }
-}
+// collectFiles imported from queue-utils (uses fs.existsSync by default)
 
 /**
  * Complete a conversation: aggregate responses, write to outgoing queue, save chat history.
@@ -662,13 +590,13 @@ async function processMessage(messageFile: string): Promise<void> {
             messageWithConfirmInstruction = message;
         } else {
             // Recent turns (in-memory, fast)
-            const history = getHistory(senderId, agentId);
+            const history = getHistory(chatHistory, senderId, agentId);
             const historyPrefix = buildHistoryPrefix(history);
             // Relevant long-term memories (Supermemory, async)
             const memoryPrefix = await searchMemory(senderId, rawMessage);
             messageWithConfirmInstruction = buildConfirmInstruction() + memoryPrefix + historyPrefix + message;
             // Store this user message in recent history
-            addToHistory(senderId, agentId, 'user', rawMessage);
+            addToHistory(chatHistory, senderId, agentId, 'user', rawMessage);
         }
 
         // Invoke agent
@@ -687,7 +615,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
         // Store assistant response in history (for external messages only)
         if (!isInternal) {
-            addToHistory(senderId, agentId, 'assistant', response);
+            addToHistory(chatHistory, senderId, agentId, 'assistant', response);
             // Persist to Supermemory in background (non-blocking)
             storeMemory(senderId, agentId, rawMessage, response).catch(() => {});
         }
