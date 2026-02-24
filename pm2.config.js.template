@@ -1,0 +1,41 @@
+// pm2 ecosystem config for TinyClaw on the tinyclaw droplet.
+// Copy this to pm2.config.js and fill in real API keys.
+// pm2.config.js is gitignored — never commit real keys.
+
+const BASE_ENV = {
+  HOME: '/home/tinyclaw',
+  ANTHROPIC_API_KEY: 'REPLACE_WITH_REAL_KEY',
+  SUPERMEMORY_API_KEY: 'REPLACE_WITH_REAL_KEY',
+  PATH: '/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin',
+};
+
+module.exports = {
+  apps: [
+    {
+      name: 'tinyclaw-queue',
+      script: '/root/tinyclaw/dist/queue-processor.js',
+      cwd: '/root/tinyclaw',
+      user: 'tinyclaw',
+      env: BASE_ENV,
+      restart_delay: 3000,
+      max_restarts: 10,
+      autorestart: true,
+      watch: false,
+      error_file: '/home/tinyclaw/.tinyclaw/logs/pm2-queue-error.log',
+      out_file:   '/home/tinyclaw/.tinyclaw/logs/pm2-queue-out.log',
+    },
+    {
+      name: 'tinyclaw-telegram',
+      script: '/root/tinyclaw/dist/channels/telegram-client.js',
+      cwd: '/root/tinyclaw',
+      user: 'tinyclaw',
+      env: BASE_ENV,
+      restart_delay: 3000,
+      max_restarts: 10,
+      autorestart: true,
+      watch: false,
+      error_file: '/home/tinyclaw/.tinyclaw/logs/pm2-telegram-error.log',
+      out_file:   '/home/tinyclaw/.tinyclaw/logs/pm2-telegram-out.log',
+    },
+  ],
+};
