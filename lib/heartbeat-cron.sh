@@ -11,6 +11,7 @@ if [ -z "$TINYCLAW_HOME" ]; then
     fi
 fi
 LOG_FILE="$TINYCLAW_HOME/logs/heartbeat.log"
+STATE_FILE="$TINYCLAW_HOME/data/heartbeat-state.json"
 QUEUE_INCOMING="$TINYCLAW_HOME/queue/incoming"
 QUEUE_OUTGOING="$TINYCLAW_HOME/queue/outgoing"
 SETTINGS_FILE="$TINYCLAW_HOME/settings.json"
@@ -23,7 +24,7 @@ if [ -f "$SETTINGS_FILE" ]; then
 fi
 INTERVAL=${INTERVAL:-3600}
 
-mkdir -p "$(dirname "$LOG_FILE")" "$QUEUE_INCOMING" "$QUEUE_OUTGOING"
+mkdir -p "$(dirname "$LOG_FILE")" "$(dirname "$STATE_FILE")" "$QUEUE_INCOMING" "$QUEUE_OUTGOING"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -33,6 +34,18 @@ log "Heartbeat started (interval: ${INTERVAL}s)"
 
 while true; do
     sleep "$INTERVAL"
+
+    # Cooldown: skip if last heartbeat was sent less than INTERVAL seconds ago
+    # Prevents heartbeat storm on PM2 restart
+    NOW_EPOCH=$(date +%s)
+    if [ -f "$STATE_FILE" ] && command -v jq &> /dev/null; then
+        LAST_SENT=$(jq -r '.last_sent_epoch // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+        ELAPSED=$((NOW_EPOCH - LAST_SENT))
+        if [ "$ELAPSED" -lt "$INTERVAL" ]; then
+            log "Heartbeat cooldown: last sent ${ELAPSED}s ago (interval: ${INTERVAL}s), skipping"
+            continue
+        fi
+    fi
 
     log "Heartbeat check - scanning all agents..."
 
@@ -101,6 +114,14 @@ while true; do
     done
 
     log "Heartbeat sent to $AGENT_COUNT agent(s)"
+
+    # Persist state for cooldown across restarts
+    jq -n \
+        --argjson last_sent_epoch "$NOW_EPOCH" \
+        --argjson agent_count "$AGENT_COUNT" \
+        --arg last_sent_iso "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{last_sent_epoch: $last_sent_epoch, last_sent_iso: $last_sent_iso, agent_count: $agent_count}' \
+        > "$STATE_FILE" 2>/dev/null
 
     # Optional: wait and log responses
     sleep 10
