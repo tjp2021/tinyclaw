@@ -1,12 +1,43 @@
 import fs from 'fs';
 import path from 'path';
-import { LOG_FILE, EVENTS_DIR } from './config';
+import pino from 'pino';
+import { EVENTS_DIR } from './config';
 
+/**
+ * Structured Pino logger for TinyClaw.
+ *
+ * JSON output to stdout (PM2 captures it). No sync file writes.
+ * OTel PinoInstrumentation will inject trace_id/span_id when active.
+ */
+export const logger = pino({
+    level: process.env.LOG_LEVEL || 'info',
+    formatters: {
+        level: (label) => ({ level: label }),
+    },
+    base: { service: 'tinyclaw' },
+});
+
+/**
+ * Backwards-compatible log function.
+ * Maps string levels to Pino levels. Callers can migrate to logger.info() etc. over time.
+ */
 export function log(level: string, message: string): void {
-    const timestamp = new Date().toISOString();
-    const logMessage = `[${timestamp}] [${level}] ${message}\n`;
-    console.log(logMessage.trim());
-    fs.appendFileSync(LOG_FILE, logMessage);
+    const pinoLevel = level.toLowerCase();
+    switch (pinoLevel) {
+        case 'error':
+            logger.error(message);
+            break;
+        case 'warn':
+        case 'warning':
+            logger.warn(message);
+            break;
+        case 'debug':
+            logger.debug(message);
+            break;
+        default:
+            logger.info(message);
+            break;
+    }
 }
 
 /**

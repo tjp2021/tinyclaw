@@ -1,18 +1,13 @@
 /**
  * Approval gate for TinyClaw — intercepts dangerous commands before execution.
  *
- * Flow:
- *   1. buildConfirmInstruction() is prepended to every agent message
- *   2. Claude outputs [CONFIRM_REQUIRED: description] and stops before running dangerous commands
- *   3. detectConfirmRequired() scans responses for this pattern
- *   4. buildApprovalMessage() formats the Telegram approval request
- *   5. Queue blocks until Tim replies yes/no
+ * The local module remains as a thin compatibility wrapper over the
+ * canonical shared capability extracted into `approval-gate`.
  */
 
-/**
- * Patterns that require explicit approval before execution.
- * Each entry is a regex tested against the Claude response text.
- */
+import { existsSync } from 'fs';
+import { basename, dirname, join } from 'path';
+
 export const DANGEROUS_PATTERNS: { label: string; pattern: RegExp }[] = [
     { label: 'vercel deploy',       pattern: /\bvercel\b(?!.*\bdev\b)/i },
     { label: 'eas build/submit',    pattern: /\beas\s+(build|submit)\b/i },
@@ -26,11 +21,79 @@ export const DANGEROUS_PATTERNS: { label: string; pattern: RegExp }[] = [
     { label: 'fly launch',          pattern: /\bfly\s+launch\b/i },
 ];
 
-/**
- * System instruction prepended to every agent message.
- * Tells Claude to output [CONFIRM_REQUIRED: ...] and stop before running dangerous commands.
- */
-export function buildConfirmInstruction(): string {
+interface ApprovalGateModule {
+    buildConfirmInstruction(): string;
+    detectConfirmRequired(response: string): string | null;
+    buildApprovalMessage(agentId: string, description: string, originalMessage: string): string;
+    parseApprovalReply(text: string): 'approved' | 'denied' | null;
+}
+
+let capabilityModule: ApprovalGateModule | null | undefined;
+
+function findYngRoot(startDir: string): string | null {
+    let current = startDir;
+    while (true) {
+        if (basename(current) === 'YNG') {
+            return current;
+        }
+        const parent = dirname(current);
+        if (parent === current) {
+            return null;
+        }
+        current = parent;
+    }
+}
+
+function useApprovalGateCapability(): boolean {
+    return (process.env.TINYCLAW_USE_APPROVAL_GATE_CAPABILITY || 'true').toLowerCase() !== 'false';
+}
+
+function resolveCapabilityPath(): string {
+    const candidates: string[] = [];
+    const override = process.env.TINYCLAW_APPROVAL_GATE_CAPABILITY_PATH;
+    if (override) {
+        candidates.push(override, join(override, 'src', 'index.cjs'), join(override, 'index.cjs'));
+    }
+
+    const yngRoot = findYngRoot(__dirname);
+    if (yngRoot) {
+        candidates.push(
+            join(
+                yngRoot,
+                '02_projects',
+                'capabilities',
+                'app-agnostic',
+                'approval-gate',
+                'src',
+                'index.cjs'
+            )
+        );
+    }
+
+    for (const candidate of candidates) {
+        if (existsSync(candidate)) {
+            return candidate;
+        }
+    }
+
+    throw new Error(`approval-gate capability not found. Checked: ${candidates.join(', ')}`);
+}
+
+function loadCapabilityModule(): ApprovalGateModule | null {
+    if (capabilityModule !== undefined) {
+        return capabilityModule;
+    }
+
+    if (!useApprovalGateCapability()) {
+        capabilityModule = null;
+        return capabilityModule;
+    }
+
+    capabilityModule = require(resolveCapabilityPath()) as ApprovalGateModule;
+    return capabilityModule;
+}
+
+function legacyBuildConfirmInstruction(): string {
     const labels = DANGEROUS_PATTERNS.map(p => `- ${p.label}`).join('\n');
     return `[SYSTEM: APPROVAL GATE]
 Before executing any of the following dangerous operations, you MUST output the exact token:
@@ -47,19 +110,12 @@ Do NOT proceed until you receive "yes" or "approve".
 `;
 }
 
-/**
- * Scan a response string for [CONFIRM_REQUIRED: ...] pattern.
- * Returns the description if found, null otherwise.
- */
-export function detectConfirmRequired(response: string): string | null {
+function legacyDetectConfirmRequired(response: string): string | null {
     const match = response.match(/\[CONFIRM_REQUIRED:\s*([^\]]+)\]/i);
     return match ? match[1].trim() : null;
 }
 
-/**
- * Format the Telegram approval request message.
- */
-export function buildApprovalMessage(agentId: string, description: string, originalMsg: string): string {
+function legacyBuildApprovalMessage(agentId: string, description: string, originalMsg: string): string {
     const preview = originalMsg.length > 120 ? originalMsg.substring(0, 120) + '...' : originalMsg;
     return [
         `⚠️ *Approval Required*`,
@@ -74,11 +130,7 @@ export function buildApprovalMessage(agentId: string, description: string, origi
     ].join('\n');
 }
 
-/**
- * Check if a message is an approval reply (yes/no).
- * Returns 'approved', 'denied', or null.
- */
-export function parseApprovalReply(text: string): 'approved' | 'denied' | null {
+function legacyParseApprovalReply(text: string): 'approved' | 'denied' | null {
     const normalized = text.trim().toLowerCase();
     if (['yes', 'y', 'approve', 'approved', 'confirm', 'ok', 'yep', 'yup', 'do it'].includes(normalized)) {
         return 'approved';
@@ -87,4 +139,20 @@ export function parseApprovalReply(text: string): 'approved' | 'denied' | null {
         return 'denied';
     }
     return null;
+}
+
+export function buildConfirmInstruction(): string {
+    return (loadCapabilityModule()?.buildConfirmInstruction ?? legacyBuildConfirmInstruction)();
+}
+
+export function detectConfirmRequired(response: string): string | null {
+    return (loadCapabilityModule()?.detectConfirmRequired ?? legacyDetectConfirmRequired)(response);
+}
+
+export function buildApprovalMessage(agentId: string, description: string, originalMsg: string): string {
+    return (loadCapabilityModule()?.buildApprovalMessage ?? legacyBuildApprovalMessage)(agentId, description, originalMsg);
+}
+
+export function parseApprovalReply(text: string): 'approved' | 'denied' | null {
+    return (loadCapabilityModule()?.parseApprovalReply ?? legacyParseApprovalReply)(text);
 }

@@ -123,7 +123,9 @@ function loadMemoryContext(workingDir: string, userMessage: string): string {
     return `[MEMORY]\n${sections.join('\n\n')}\n[/MEMORY]\n\n`;
 }
 
-export async function runCommand(command: string, args: string[], cwd?: string): Promise<string> {
+const INVOKE_TIMEOUT_MS = 120_000; // 120 seconds — kill agent if it takes longer
+
+export async function runCommand(command: string, args: string[], cwd?: string, timeoutMs?: number): Promise<string> {
     return new Promise((resolve, reject) => {
         const child = spawn(command, args, {
             cwd: cwd || SCRIPT_DIR,
@@ -132,6 +134,7 @@ export async function runCommand(command: string, args: string[], cwd?: string):
 
         let stdout = '';
         let stderr = '';
+        let timedOut = false;
 
         child.stdout.setEncoding('utf8');
         child.stderr.setEncoding('utf8');
@@ -144,11 +147,28 @@ export async function runCommand(command: string, args: string[], cwd?: string):
             stderr += chunk;
         });
 
+        // Timeout: kill child process if it exceeds the limit
+        const timeout = timeoutMs ?? INVOKE_TIMEOUT_MS;
+        const timer = setTimeout(() => {
+            timedOut = true;
+            child.kill('SIGTERM');
+            // Force kill after 5s if SIGTERM doesn't work
+            setTimeout(() => {
+                if (!child.killed) child.kill('SIGKILL');
+            }, 5000);
+        }, timeout);
+
         child.on('error', (error) => {
+            clearTimeout(timer);
             reject(error);
         });
 
         child.on('close', (code) => {
+            clearTimeout(timer);
+            if (timedOut) {
+                reject(new Error(`Command timed out after ${timeout / 1000}s: ${command} ${args[0]}`));
+                return;
+            }
             if (code === 0) {
                 resolve(stdout);
                 return;

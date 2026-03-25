@@ -28,6 +28,7 @@ import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammate
 import { invokeAgent, runCommand } from './lib/invoke';
 import { buildConfirmInstruction, detectConfirmRequired, buildApprovalMessage, parseApprovalReply } from './lib/approval';
 import { storeMemory, searchMemory } from './lib/supermemory';
+import { withSpan } from './tracing';
 import {
     splitIntoChunks, buildHistoryPrefix, addToHistory, getHistory, collectFiles,
     MAX_HISTORY_ENTRIES, MAX_HISTORY_CHARS, HistoryEntry,
@@ -593,7 +594,7 @@ async function processMessage(messageFile: string): Promise<void> {
             const history = getHistory(chatHistory, senderId, agentId);
             const historyPrefix = buildHistoryPrefix(history);
             // Relevant long-term memories (Supermemory, async)
-            const memoryPrefix = await searchMemory(senderId, rawMessage);
+            const memoryPrefix = await withSpan('agent.memory.search', { 'memory.sender_id': senderId }, async () => searchMemory(senderId, rawMessage));
             messageWithConfirmInstruction = buildConfirmInstruction() + memoryPrefix + historyPrefix + message;
             // Store this user message in recent history
             addToHistory(chatHistory, senderId, agentId, 'user', rawMessage);
@@ -603,7 +604,16 @@ async function processMessage(messageFile: string): Promise<void> {
         emitEvent('chain_step_start', { agentId, agentName: agent.name, fromAgent: messageData.fromAgent || null });
         let response: string;
         try {
-            response = await invokeAgent(agent, agentId, messageWithConfirmInstruction, workspacePath, shouldReset, agents, teams);
+            response = await withSpan('agent.invoke', {
+                'agent.id': agentId,
+                'agent.name': agent.name,
+                'agent.provider': agent.provider || 'anthropic',
+                'agent.model': agent.model,
+                'message.channel': channel,
+                'message.is_internal': isInternal,
+            }, async () => {
+                return invokeAgent(agent, agentId, messageWithConfirmInstruction, workspacePath, shouldReset, agents, teams);
+            });
         } catch (error) {
             const provider = agent.provider || 'anthropic';
             const errMsg = (error as Error).message;
@@ -785,12 +795,42 @@ async function processMessage(messageFile: string): Promise<void> {
     } catch (error) {
         log('ERROR', `Processing error: ${(error as Error).message}`);
 
-        // Move back to incoming for retry
+        // Retry with counter — dead-letter after 3 attempts
         if (fs.existsSync(processingFile)) {
             try {
-                fs.renameSync(processingFile, messageFile);
+                const msgData: MessageData = JSON.parse(fs.readFileSync(processingFile, 'utf8'));
+                const retryCount = (msgData.retryCount || 0) + 1;
+                const MAX_RETRIES = 3;
+
+                if (retryCount >= MAX_RETRIES) {
+                    // Dead-letter: move to a dead-letter directory
+                    const deadLetterDir = path.join(path.dirname(QUEUE_INCOMING), 'dead-letter');
+                    if (!fs.existsSync(deadLetterDir)) fs.mkdirSync(deadLetterDir, { recursive: true });
+                    const deadLetterFile = path.join(deadLetterDir, path.basename(processingFile));
+                    fs.renameSync(processingFile, deadLetterFile);
+                    log('ERROR', `Dead-lettered message after ${MAX_RETRIES} failures: ${path.basename(processingFile)}`);
+
+                    // Notify the user their message failed
+                    if (msgData.channel && msgData.sender && msgData.messageId) {
+                        writeDirectResponse(
+                            msgData.channel,
+                            msgData.sender,
+                            msgData.senderId || msgData.sender,
+                            msgData.messageId,
+                            `Sorry, I wasn't able to process your message after ${MAX_RETRIES} attempts. Please try again.`
+                        );
+                    }
+                } else {
+                    // Increment retry count and move back for retry
+                    msgData.retryCount = retryCount;
+                    fs.writeFileSync(processingFile, JSON.stringify(msgData, null, 2));
+                    fs.renameSync(processingFile, messageFile);
+                    log('WARN', `Retrying message (attempt ${retryCount}/${MAX_RETRIES}): ${path.basename(messageFile)}`);
+                }
             } catch (e) {
-                log('ERROR', `Failed to move file back: ${(e as Error).message}`);
+                log('ERROR', `Failed to handle retry/dead-letter: ${(e as Error).message}`);
+                // Last resort — just delete the processing file to prevent infinite loop
+                try { fs.unlinkSync(processingFile); } catch { /* ignore */ }
             }
         }
     }
@@ -853,7 +893,7 @@ async function processQueue(): Promise<void> {
 
                 // Chain this message to the agent's promise
                 const newChain = currentChain
-                    .then(() => processMessage(file.path))
+                    .then(() => withSpan('queue.process', { 'queue.agent_id': agentId, 'queue.file': file.name }, () => processMessage(file.path)))
                     .catch(error => {
                         log('ERROR', `Error processing message for agent ${agentId}: ${error.message}`);
                     })
@@ -922,4 +962,16 @@ process.on('SIGINT', () => {
 process.on('SIGTERM', () => {
     log('INFO', 'Shutting down queue processor...');
     process.exit(0);
+});
+
+// Global error handlers — log and exit rather than silently crashing
+process.on('uncaughtException', (err) => {
+    log('ERROR', `Uncaught exception: ${err.message}\n${err.stack}`);
+    process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+    const message = reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason);
+    log('ERROR', `Unhandled rejection: ${message}`);
+    // Don't exit — log and continue. PM2 will restart if it keeps happening.
 });

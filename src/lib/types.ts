@@ -60,6 +60,8 @@ export interface MessageData {
     // Internal message fields (agent-to-agent)
     conversationId?: string; // links to parent conversation
     fromAgent?: string;      // which agent sent this internal message
+    // Retry tracking
+    retryCount?: number;     // incremented on each failure, dead-letter after 3
 }
 
 export interface Conversation {

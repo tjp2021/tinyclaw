@@ -1,7 +1,11 @@
 /**
  * Pure utility functions for queue processing.
- * Extracted here so they can be unit tested independently of queue-processor.ts
+ * The local module remains as a thin compatibility wrapper over the
+ * canonical shared capability extracted into `chat-queue-utils`.
  */
+
+import { existsSync } from 'fs';
+import { basename, dirname, join } from 'path';
 
 export const TELEGRAM_MAX_CHARS = 4000;
 export const MAX_HISTORY_ENTRIES = 10;
@@ -10,11 +14,90 @@ export const MAX_ENTRY_CHARS = 2000;
 
 export interface HistoryEntry { role: 'user' | 'assistant'; content: string; }
 
-/**
- * Split a response into Telegram-safe chunks at natural boundaries.
- * Returns array of strings, each under maxChars.
- */
-export function splitIntoChunks(text: string, maxChars = TELEGRAM_MAX_CHARS): string[] {
+interface ChatQueueUtilsModule {
+    splitIntoChunks(text: string, maxChars?: number): string[];
+    buildHistoryPrefix(history: HistoryEntry[], maxChars?: number): string;
+    addToHistory(
+        chatHistory: Map<string, HistoryEntry[]>,
+        senderId: string,
+        agentId: string,
+        role: 'user' | 'assistant',
+        content: string
+    ): void;
+    getHistory(
+        chatHistory: Map<string, HistoryEntry[]>,
+        senderId: string,
+        agentId: string
+    ): HistoryEntry[];
+    collectFiles(response: string, fileSet: Set<string>, existsCheck?: (filePath: string) => boolean): void;
+}
+
+let capabilityModule: ChatQueueUtilsModule | null | undefined;
+
+function findYngRoot(startDir: string): string | null {
+    let current = startDir;
+    while (true) {
+        if (basename(current) === 'YNG') {
+            return current;
+        }
+        const parent = dirname(current);
+        if (parent === current) {
+            return null;
+        }
+        current = parent;
+    }
+}
+
+function useChatQueueUtilsCapability(): boolean {
+    return (process.env.TINYCLAW_USE_CHAT_QUEUE_UTILS_CAPABILITY || 'true').toLowerCase() !== 'false';
+}
+
+function resolveCapabilityPath(): string {
+    const candidates: string[] = [];
+    const override = process.env.TINYCLAW_CHAT_QUEUE_UTILS_CAPABILITY_PATH;
+    if (override) {
+        candidates.push(override, join(override, 'src', 'index.cjs'), join(override, 'index.cjs'));
+    }
+
+    const yngRoot = findYngRoot(__dirname);
+    if (yngRoot) {
+        candidates.push(
+            join(
+                yngRoot,
+                '02_projects',
+                'capabilities',
+                'app-agnostic',
+                'chat-queue-utils',
+                'src',
+                'index.cjs'
+            )
+        );
+    }
+
+    for (const candidate of candidates) {
+        if (existsSync(candidate)) {
+            return candidate;
+        }
+    }
+
+    throw new Error(`chat-queue-utils capability not found. Checked: ${candidates.join(', ')}`);
+}
+
+function loadCapabilityModule(): ChatQueueUtilsModule | null {
+    if (capabilityModule !== undefined) {
+        return capabilityModule;
+    }
+
+    if (!useChatQueueUtilsCapability()) {
+        capabilityModule = null;
+        return capabilityModule;
+    }
+
+    capabilityModule = require(resolveCapabilityPath()) as ChatQueueUtilsModule;
+    return capabilityModule;
+}
+
+function legacySplitIntoChunks(text: string, maxChars = TELEGRAM_MAX_CHARS): string[] {
     if (text.length <= maxChars) return [text];
 
     const chunks: string[] = [];
@@ -23,12 +106,10 @@ export function splitIntoChunks(text: string, maxChars = TELEGRAM_MAX_CHARS): st
     while (remaining.length > maxChars) {
         let splitAt = maxChars;
 
-        // Try to split at a paragraph boundary
         const paraBreak = remaining.lastIndexOf('\n\n', maxChars);
         if (paraBreak > maxChars * 0.5) {
             splitAt = paraBreak + 2;
         } else {
-            // Fall back to newline
             const lineBreak = remaining.lastIndexOf('\n', maxChars);
             if (lineBreak > maxChars * 0.5) {
                 splitAt = lineBreak + 1;
@@ -43,11 +124,7 @@ export function splitIntoChunks(text: string, maxChars = TELEGRAM_MAX_CHARS): st
     return chunks;
 }
 
-/**
- * Build a history prefix string to prepend to agent messages.
- * Walks backwards through history, including as many entries as fit in maxChars.
- */
-export function buildHistoryPrefix(history: HistoryEntry[], maxChars = MAX_HISTORY_CHARS): string {
+function legacyBuildHistoryPrefix(history: HistoryEntry[], maxChars = MAX_HISTORY_CHARS): string {
     if (history.length === 0) return '';
     let block = '[RECENT CONVERSATION HISTORY]\n';
     let totalChars = 0;
@@ -64,10 +141,7 @@ export function buildHistoryPrefix(history: HistoryEntry[], maxChars = MAX_HISTO
     return block;
 }
 
-/**
- * Add a message to chat history, capping entries and per-entry size.
- */
-export function addToHistory(
+function legacyAddToHistory(
     chatHistory: Map<string, HistoryEntry[]>,
     senderId: string,
     agentId: string,
@@ -81,10 +155,7 @@ export function addToHistory(
     chatHistory.set(key, history);
 }
 
-/**
- * Retrieve history for a sender+agent pair.
- */
-export function getHistory(
+function legacyGetHistory(
     chatHistory: Map<string, HistoryEntry[]>,
     senderId: string,
     agentId: string
@@ -92,15 +163,49 @@ export function getHistory(
     return chatHistory.get(`${senderId}:${agentId}`) || [];
 }
 
-/**
- * Extract [send_file: /path] references from a response.
- * Only adds paths that actually exist on disk.
- */
-export function collectFiles(response: string, fileSet: Set<string>, existsCheck = require('fs').existsSync): void {
+function legacyCollectFiles(
+    response: string,
+    fileSet: Set<string>,
+    existsCheck: (filePath: string) => boolean = existsSync
+): void {
     const fileRegex = /\[send_file:\s*([^\]]+)\]/g;
     let match: RegExpExecArray | null;
     while ((match = fileRegex.exec(response)) !== null) {
         const filePath = match[1].trim();
         if (existsCheck(filePath)) fileSet.add(filePath);
     }
+}
+
+export function splitIntoChunks(text: string, maxChars = TELEGRAM_MAX_CHARS): string[] {
+    return (loadCapabilityModule()?.splitIntoChunks ?? legacySplitIntoChunks)(text, maxChars);
+}
+
+export function buildHistoryPrefix(history: HistoryEntry[], maxChars = MAX_HISTORY_CHARS): string {
+    return (loadCapabilityModule()?.buildHistoryPrefix ?? legacyBuildHistoryPrefix)(history, maxChars);
+}
+
+export function addToHistory(
+    chatHistory: Map<string, HistoryEntry[]>,
+    senderId: string,
+    agentId: string,
+    role: 'user' | 'assistant',
+    content: string
+): void {
+    (loadCapabilityModule()?.addToHistory ?? legacyAddToHistory)(chatHistory, senderId, agentId, role, content);
+}
+
+export function getHistory(
+    chatHistory: Map<string, HistoryEntry[]>,
+    senderId: string,
+    agentId: string
+): HistoryEntry[] {
+    return (loadCapabilityModule()?.getHistory ?? legacyGetHistory)(chatHistory, senderId, agentId);
+}
+
+export function collectFiles(
+    response: string,
+    fileSet: Set<string>,
+    existsCheck: (filePath: string) => boolean = existsSync
+): void {
+    (loadCapabilityModule()?.collectFiles ?? legacyCollectFiles)(response, fileSet, existsCheck);
 }

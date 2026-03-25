@@ -10,6 +10,7 @@ import qrcode from 'qrcode-terminal';
 import fs from 'fs';
 import path from 'path';
 import { ensureSenderPaired } from '../lib/pairing';
+import { createApiServer } from './whatsapp-api';
 
 const SCRIPT_DIR = path.resolve(__dirname, '..', '..');
 const _localTinyclaw = path.join(SCRIPT_DIR, '.tinyclaw');
@@ -206,6 +207,8 @@ client.on('qr', (qr: string) => {
         fs.mkdirSync(channelsDir, { recursive: true });
     }
     const qrFile = path.join(channelsDir, 'whatsapp_qr.txt');
+    const qrRawFile = path.join(channelsDir, 'whatsapp_qr_raw.txt');
+    fs.writeFileSync(qrRawFile, qr);
     qrcode.generate(qr, { small: true }, (code: string) => {
         fs.writeFileSync(qrFile, code);
         log('INFO', 'QR code saved to .tinyclaw/channels/whatsapp_qr.txt');
@@ -228,6 +231,16 @@ client.on('ready', () => {
     // Create ready flag for tinyclaw.sh
     const readyFile = path.join(SCRIPT_DIR, '.tinyclaw/channels/whatsapp_ready');
     fs.writeFileSync(readyFile, Date.now().toString());
+
+    // Start HTTP API server (shares the client singleton)
+    const apiPort = parseInt(process.env.WHATSAPP_API_PORT || '7700', 10);
+    const apiServer = createApiServer(client);
+    apiServer.listen(apiPort, '0.0.0.0', () => {
+        log('INFO', `✓ WhatsApp API server listening on 0.0.0.0:${apiPort}`);
+    });
+    apiServer.on('error', (err: Error) => {
+        log('ERROR', `API server error: ${err.message}`);
+    });
 });
 
 // Message received - Write to queue

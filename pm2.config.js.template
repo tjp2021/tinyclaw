@@ -7,6 +7,11 @@ const BASE_ENV = {
   ANTHROPIC_API_KEY: 'REPLACE_WITH_REAL_KEY',
   SUPERMEMORY_API_KEY: 'REPLACE_WITH_REAL_KEY',
   PATH: '/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin',
+  // OpenTelemetry — uncomment to enable tracing to Grafana Cloud
+  // OTEL_EXPORTER_OTLP_ENDPOINT: 'https://otlp-gateway-prod-us-east-3.grafana.net/otlp',
+  // OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Basic MTU1MTQyMzpnbGNfZXlKdklqb2lNVFk1TWpNMU9TSXNJbTRpT2lKdmRHVnNMWEJ5YjJSMVkzUnBiMjRpTENKcklqb2ljelF3ZEdWTFZYcFlNVzlUYm5ScWVEQTNNVFU1UVRjNElpd2liU0k2ZXlKeUlqb2ljSEp2WkMxMWN5MWxZWE4wTFRNaWZYMD0=',
+  // OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
+  // OTEL_SERVICE_NAME: 'tinyclaw',
 };
 
 module.exports = {
@@ -16,6 +21,7 @@ module.exports = {
       script: '/root/tinyclaw/dist/queue-processor.js',
       cwd: '/root/tinyclaw',
       user: 'tinyclaw',
+      node_args: '--require ./dist/tracing.js',
       env: BASE_ENV,
       restart_delay: 3000,
       max_restarts: 10,
@@ -23,12 +29,14 @@ module.exports = {
       watch: false,
       error_file: '/home/tinyclaw/.tinyclaw/logs/pm2-queue-error.log',
       out_file:   '/home/tinyclaw/.tinyclaw/logs/pm2-queue-out.log',
+      max_memory_restart: '500M',
     },
     {
       name: 'tinyclaw-telegram',
       script: '/root/tinyclaw/dist/channels/telegram-client.js',
       cwd: '/root/tinyclaw',
       user: 'tinyclaw',
+      node_args: '--require ./dist/tracing.js',
       env: BASE_ENV,
       restart_delay: 3000,
       max_restarts: 10,
@@ -36,6 +44,7 @@ module.exports = {
       watch: false,
       error_file: '/home/tinyclaw/.tinyclaw/logs/pm2-telegram-error.log',
       out_file:   '/home/tinyclaw/.tinyclaw/logs/pm2-telegram-out.log',
+      max_memory_restart: '300M',
     },
   ],
 };
